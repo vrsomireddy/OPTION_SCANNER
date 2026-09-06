@@ -23,11 +23,10 @@ import os
 import smtplib
 import sys
 import time
-from dataclasses import dataclass, asdict
-from datetime import datetime, date, timezone
+from dataclasses import asdict, dataclass
+from datetime import date, datetime
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 import yfinance as yf
@@ -67,7 +66,7 @@ class PutCandidate:
     annualized_return: float    # bid / strike * 365 / dte
     breakeven: float            # strike - bid
     prob_otm: float             # 1 - |delta|
-    earnings_date: Optional[str]
+    earnings_date: str | None
     score: float = 0.0
 
 
@@ -75,7 +74,7 @@ class PutCandidate:
 # Math
 # ---------------------------------------------------------------------------
 def bs_put_delta(spot: float, strike: float, t_years: float, r: float, iv: float) -> float:
-    """Black-Scholes delta for a European put (negative number)."""
+    """Estimate how sensitive an option's price is to stock moves, used to gauge how risky a put is."""
     if spot <= 0 or strike <= 0 or t_years <= 0 or iv <= 0:
         return float("nan")
     d1 = (math.log(spot / strike) + (r + 0.5 * iv * iv) * t_years) / (iv * math.sqrt(t_years))
@@ -85,7 +84,8 @@ def bs_put_delta(spot: float, strike: float, t_years: float, r: float, iv: float
 # ---------------------------------------------------------------------------
 # Data fetch helpers (each wrapped so one bad ticker never kills the run)
 # ---------------------------------------------------------------------------
-def get_spot_and_volume(tk: yf.Ticker) -> tuple[Optional[float], Optional[float]]:
+def get_spot_and_volume(tk: yf.Ticker) -> tuple[float | None, float | None]:
+    """Look up a stock's current price and typical daily trading volume."""
     try:
         fi = tk.fast_info
         spot = float(fi["last_price"])
@@ -107,8 +107,8 @@ def get_spot_and_volume(tk: yf.Ticker) -> tuple[Optional[float], Optional[float]
         return None, None
 
 
-def get_next_earnings(tk: yf.Ticker) -> Optional[date]:
-    """Next earnings date on/after today, or None if unavailable."""
+def get_next_earnings(tk: yf.Ticker) -> date | None:
+    """Find the company's next earnings announcement date, if known."""
     today = date.today()
     try:
         df = tk.get_earnings_dates(limit=8)
@@ -137,6 +137,7 @@ def get_next_earnings(tk: yf.Ticker) -> Optional[date]:
 # Scan
 # ---------------------------------------------------------------------------
 def scan_ticker(symbol: str, today: date) -> list[PutCandidate]:
+    """Check one stock and return every put option worth considering for it."""
     tk = yf.Ticker(symbol)
     spot, avg_vol = get_spot_and_volume(tk)
     if spot is None:
@@ -233,12 +234,7 @@ def scan_ticker(symbol: str, today: date) -> list[PutCandidate]:
 
 
 def score(cands: list[PutCandidate]) -> list[PutCandidate]:
-    """
-    Deterministic composite score in [0, 1].
-      yield   : annualized return, capped at 60% and normalized to 0..1
-      safety  : 1 - |delta|  (approx. probability the put expires worthless)
-      cushion : % OTM, capped at 20% and normalized to 0..1
-    """
+    """Rate and rank each candidate by how attractive a trade it is, best first."""
     for c in cands:
         y = min(c.annualized_return, 0.60) / 0.60
         s = c.prob_otm
@@ -249,6 +245,7 @@ def score(cands: list[PutCandidate]) -> list[PutCandidate]:
 
 
 def pick_top(cands: list[PutCandidate]) -> list[PutCandidate]:
+    """Select the day's best suggestions, limiting how many come from the same stock."""
     seen: dict[str, int] = {}
     picks = []
     for c in cands:
@@ -265,6 +262,7 @@ def pick_top(cands: list[PutCandidate]) -> list[PutCandidate]:
 # Output
 # ---------------------------------------------------------------------------
 def to_markdown(picks: list[PutCandidate], scanned: int, total_cands: int, run_ts: datetime) -> str:
+    """Turn the day's picks into a readable report."""
     lines = [
         f"# Cash-Secured Put Suggestions — {run_ts.strftime('%Y-%m-%d %H:%M %Z')}",
         "",
@@ -308,6 +306,7 @@ def to_markdown(picks: list[PutCandidate], scanned: int, total_cands: int, run_t
 
 
 def to_sms(picks: list[PutCandidate], run_ts: datetime) -> str:
+    """Condense the day's picks into a short text-message-friendly summary."""
     if not picks:
         return f"Put scan {run_ts:%m/%d}: no qualifying contracts."
     parts = [f"Put scan {run_ts:%m/%d}:"]
@@ -318,6 +317,7 @@ def to_sms(picks: list[PutCandidate], run_ts: datetime) -> str:
 
 
 def send_email(subject: str, body: str, to_addr: str, subtype: str = "plain") -> None:
+    """Send the report to someone's inbox by email."""
     host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     port = int(os.getenv("SMTP_PORT", "587"))
     user = os.getenv("SMTP_USER")
@@ -340,6 +340,7 @@ def send_email(subject: str, body: str, to_addr: str, subtype: str = "plain") ->
 # Main
 # ---------------------------------------------------------------------------
 def main() -> int:
+    """Run the full daily scan: check every stock, rank the results, and deliver the report."""
     run_ts = datetime.now().astimezone()
     if "--test-email" in sys.argv:
         to_addr = os.getenv("EMAIL_TO")

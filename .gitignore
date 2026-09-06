@@ -3,3 +3,6 @@ reports/
 logs/
 .env
 __pycache__/
+CLAUDE.md
+.coverage
+.pytest_cache/
