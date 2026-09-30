@@ -33,6 +33,27 @@ SKIP_EARNINGS = True        # drop expirations that span an earnings date
 RISK_FREE_RATE = 0.04       # used in Black-Scholes delta
 
 # ---------------------------------------------------------------------------
+# Premium richness: implied vol compared with the stock's own realized vol.
+# Yahoo has no IV history, so IV / 1-year realized vol stands in for IV rank.
+# ---------------------------------------------------------------------------
+HV_LOOKBACK = "1y"          # price history used for realized volatility
+HV_MIN_DAYS = 120           # fewer daily returns than this = data failure
+IV_HV_FULL_CREDIT = 1.5     # IV/HV at or above this earns the full richness score; 1.0 or below earns none
+
+# ---------------------------------------------------------------------------
+# Portfolio limits
+# ---------------------------------------------------------------------------
+MAX_COLLATERAL = 30_000     # max cash per contract (strike x 100); None = no limit
+EXCLUDE_TICKERS = ["INTC", "MRVL", "MU"]   # never suggest (e.g. names already held)
+MAX_PER_GROUP = 1           # max displayed names (top picks + alternatives) per group below
+SECTOR_GROUPS = {
+    "Semiconductors": [
+        "ADI", "ALAB", "AMAT", "AMD", "ARM", "ASML", "AVGO", "INTC", "KLAC", "LRCX", "MCHP",
+        "MPWR", "MRVL", "MU", "NVDA", "NXPI", "QCOM", "SNDK", "TER", "TXN",
+    ],
+}
+
+# ---------------------------------------------------------------------------
 # Liquidity filters
 # ---------------------------------------------------------------------------
 MIN_AVG_STOCK_VOLUME = 1_000_000   # 10-day average shares/day
@@ -51,6 +72,7 @@ OUTPUT_DIR = "reports"      # markdown files land here (relative to script)
 # ---------------------------------------------------------------------------
 # Scoring weights (must sum to 1). See README for the formula.
 # ---------------------------------------------------------------------------
-W_YIELD = 0.45     # annualized return on collateral
-W_SAFETY = 0.35    # probability of expiring OTM (1 - |delta|)
-W_CUSHION = 0.20   # % distance from spot to strike
+W_RICHNESS = 0.40  # implied vol relative to the stock's realized vol
+W_YIELD = 0.20     # annualized return on collateral
+W_SAFETY = 0.30    # lower |delta| within the DELTA_MIN..DELTA_MAX band
+W_CUSHION = 0.10   # % distance from spot to strike

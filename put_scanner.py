@@ -68,6 +68,8 @@ class PutCandidate:
     prob_otm: float             # 1 - |delta|
     earnings_date: str | None
     score: float = 0.0
+    hv: float = float("nan")            # stock's realized volatility over HV_LOOKBACK
+    iv_hv_ratio: float = float("nan")   # iv / hv; above 1 means options price in more movement than usual
 
 
 class ScanDataError(Exception):
@@ -122,6 +124,23 @@ def get_spot_and_volume(tk: yf.Ticker) -> tuple[float | None, float | None]:
         return None, None
 
 
+def get_realized_vol(tk: yf.Ticker) -> float | None:
+    """Measure how much the stock has actually moved over the past year, skipping recently listed stocks."""
+    try:
+        hist = tk.history(period=C.HV_LOOKBACK, auto_adjust=True)
+        closes = hist["Close"].dropna()
+        returns = (closes / closes.shift(1)).apply(math.log).dropna()
+    except Exception as e:
+        log.warning("%s: could not get price history (%s)", tk.ticker, e)
+        return None
+    if returns.empty:
+        return None
+    if len(returns) < C.HV_MIN_DAYS:
+        raise ScanSkipped("too little price history for realized volatility")
+    hv = float(returns.std() * math.sqrt(252))
+    return hv if math.isfinite(hv) and hv > 0 else None
+
+
 def get_next_earnings(tk: yf.Ticker, today: date | None = None) -> date | None:
     """Find the company's next known earnings announcement on or after the scan day."""
     today = today if today is not None else date.today()
@@ -153,6 +172,8 @@ def get_next_earnings(tk: yf.Ticker, today: date | None = None) -> date | None:
 # ---------------------------------------------------------------------------
 def scan_ticker(symbol: str, today: date) -> list[PutCandidate]:
     """Find qualifying puts for one stock or explain why it could not be evaluated."""
+    if symbol in C.EXCLUDE_TICKERS:
+        raise ScanSkipped("excluded in config")
     tk = yf.Ticker(symbol)
     spot, avg_vol = get_spot_and_volume(tk)
     if spot is None or not math.isfinite(spot) or spot <= 0:
@@ -177,6 +198,10 @@ def scan_ticker(symbol: str, today: date) -> list[PutCandidate]:
         raise ScanDataError("option expirations unavailable") from e
     if not expirations:
         raise ScanSkipped("no listed option expirations")
+
+    hv = get_realized_vol(tk)
+    if hv is None:
+        raise ScanDataError("realized volatility unavailable")
 
     out: list[PutCandidate] = []
     for exp_str in expirations:
@@ -206,6 +231,8 @@ def scan_ticker(symbol: str, today: date) -> list[PutCandidate]:
             vol = int(row.volume) if not pd.isna(row.volume) else 0
 
             if strike >= spot:            # OTM puts only
+                continue
+            if C.MAX_COLLATERAL and strike * 100 > C.MAX_COLLATERAL:
                 continue
             if bid < C.MIN_BID or ask <= 0 or ask < bid:
                 continue
@@ -249,6 +276,8 @@ def scan_ticker(symbol: str, today: date) -> list[PutCandidate]:
                     breakeven=round(strike - bid, 2),
                     prob_otm=round(1 - adelta, 3),
                     earnings_date=earnings.isoformat() if earnings else None,
+                    hv=round(hv, 4),
+                    iv_hv_ratio=round(iv / hv, 3),
                 )
             )
     return out
@@ -256,21 +285,39 @@ def scan_ticker(symbol: str, today: date) -> list[PutCandidate]:
 
 def score(cands: list[PutCandidate]) -> list[PutCandidate]:
     """Rate and rank each candidate by how attractive a trade it is, best first."""
+    band = C.DELTA_MAX - C.DELTA_MIN
     for c in cands:
+        ratio = c.iv_hv_ratio if math.isfinite(c.iv_hv_ratio) else 1.0   # unknown earns no richness credit
+        rich = min(max((ratio - 1.0) / (C.IV_HV_FULL_CREDIT - 1.0), 0.0), 1.0)
         y = min(c.annualized_return, 0.60) / 0.60
-        s = c.prob_otm
+        s = min(max((C.DELTA_MAX - abs(c.delta)) / band, 0.0), 1.0) if band > 0 else 1.0
         cu = min(c.cushion_pct, 0.20) / 0.20
-        c.score = round(C.W_YIELD * y + C.W_SAFETY * s + C.W_CUSHION * cu, 4)
+        c.score = round(C.W_RICHNESS * rich + C.W_YIELD * y + C.W_SAFETY * s + C.W_CUSHION * cu, 4)
     cands.sort(key=lambda c: c.score, reverse=True)
     return cands
 
 
+def sector_group(ticker: str) -> str | None:
+    """Name the configured sector group a stock belongs to, if any."""
+    return next((name for name, members in C.SECTOR_GROUPS.items() if ticker in members), None)
+
+
+def group_is_full(ticker: str, shown: list[PutCandidate]) -> bool:
+    """Tell whether the stock's sector group already has its maximum number of names shown."""
+    group = sector_group(ticker)
+    if group is None:
+        return False
+    return len({c.ticker for c in shown if sector_group(c.ticker) == group}) >= C.MAX_PER_GROUP
+
+
 def pick_top(cands: list[PutCandidate]) -> list[PutCandidate]:
-    """Select the day's best suggestions, limiting how many come from the same stock."""
+    """Select the day's best suggestions, limiting repeats of the same stock or sector group."""
     seen: dict[str, int] = {}
     picks = []
     for c in cands:
         if seen.get(c.ticker, 0) >= C.MAX_PER_TICKER:
+            continue
+        if c.ticker not in seen and group_is_full(c.ticker, picks):
             continue
         seen[c.ticker] = seen.get(c.ticker, 0) + 1
         picks.append(c)
@@ -280,13 +327,13 @@ def pick_top(cands: list[PutCandidate]) -> list[PutCandidate]:
 
 
 def pick_alternatives(ranked: list[PutCandidate], picks: list[PutCandidate]) -> list[PutCandidate]:
-    """Choose additional qualifying stocks in score order without repeating a name."""
+    """Choose additional qualifying stocks in score order without repeating a name or overfilling a sector group."""
     seen = {c.ticker for c in picks}
     alternatives = []
     for c in ranked:
         if len(alternatives) >= C.ALTERNATIVE_N:
             break
-        if c.ticker not in seen:
+        if c.ticker not in seen and not group_is_full(c.ticker, picks + alternatives):
             alternatives.append(c)
             seen.add(c.ticker)
     return alternatives
@@ -297,6 +344,9 @@ def contract_key(c: PutCandidate) -> tuple[str, str, float]:
     return c.ticker, c.expiration, c.strike
 
 
+OPTIONAL_FIELDS = {"hv", "iv_hv_ratio"}   # absent from reports written before these were recorded
+
+
 def load_previous_scan(out_dir: Path, today: date) -> PreviousScan | None:
     """Read the latest usable earlier daily results for comparison."""
     for path in sorted(out_dir.glob("all_candidates_*.csv"), reverse=True):
@@ -305,7 +355,7 @@ def load_previous_scan(out_dir: Path, today: date) -> PreviousScan | None:
             if day >= today:
                 continue
             df = pd.read_csv(path)
-            names = [field.name for field in fields(PutCandidate)]
+            names = [field.name for field in fields(PutCandidate) if field.name in df or field.name not in OPTIONAL_FIELDS]
             records = df[names].to_dict("records")
             candidates = [PutCandidate(**row) for row in records]
             for c in candidates:
@@ -365,7 +415,9 @@ def to_markdown(
         f"Filters: |Δ| {C.DELTA_MIN:.2f}–{C.DELTA_MAX:.2f} · DTE {C.DTE_MIN}–{C.DTE_MAX} · "
         f"≥{C.MIN_ANNUALIZED_RETURN:.0%} annualized · OI ≥ {C.MIN_OPEN_INTEREST} · "
         f"spread ≤ {C.MAX_SPREAD_PCT:.0%}"
-        + (" · earnings skipped" if C.SKIP_EARNINGS else ""),
+        + (" · earnings skipped" if C.SKIP_EARNINGS else "")
+        + (f" · collateral ≤ ${C.MAX_COLLATERAL:,.0f}" if C.MAX_COLLATERAL else "")
+        + "".join(f" · ≤{C.MAX_PER_GROUP} {name}" for name in C.SECTOR_GROUPS),
         "",
     ]
     if skipped:
@@ -382,13 +434,15 @@ def to_markdown(
         return "\n".join(lines)
 
     lines += [
-        "| # | Ticker | Spot | Exp | DTE | Strike | Bid | Δ | P(OTM) | Cushion | Ann. Ret | Premium/ct | Collateral | Breakeven | Score |",
-        "|---|--------|------|-----|-----|--------|-----|---|--------|---------|----------|------------|------------|-----------|-------|",
+        "| # | Ticker | Spot | Exp | DTE | Strike | Bid | Δ | P(OTM) | Cushion | IV/HV "
+        "| Ann. Ret | Premium/ct | Collateral | Breakeven | Score |",
+        "|---|--------|------|-----|-----|--------|-----|---|--------|---------|-------"
+        "|----------|------------|------------|-----------|-------|",
     ]
     for i, c in enumerate(picks, 1):
         lines.append(
             f"| {i} | **{c.ticker}** | {c.spot:.2f} | {c.expiration} | {c.dte} | {c.strike:.2f} | "
-            f"{c.bid:.2f} | {c.delta:.2f} | {c.prob_otm:.0%} | {c.cushion_pct:.1%} | "
+            f"{c.bid:.2f} | {c.delta:.2f} | {c.prob_otm:.0%} | {c.cushion_pct:.1%} | {c.iv_hv_ratio:.2f} | "
             f"{c.annualized_return:.1%} | ${c.premium_per_contract:,.0f} | ${c.collateral:,.0f} | "
             f"{c.breakeven:.2f} | {c.score:.3f} |"
         )
@@ -397,7 +451,7 @@ def to_markdown(
         lines.append(
             f"{i}. **SELL TO OPEN 1 {c.ticker} {c.expiration} {str(c.strike).removesuffix('.0')}P @ {c.bid:.2f} (limit)**: "
             f"collect ~${c.premium_per_contract:,.0f} against ${c.collateral:,.0f} cash. "
-            f"IV {c.iv:.0%}, OI {c.open_interest:,}, spread {c.spread_pct:.1%}. "
+            f"IV {c.iv:.0%} vs {c.hv:.0%} realized ({c.iv_hv_ratio:.2f}x), OI {c.open_interest:,}, spread {c.spread_pct:.1%}. "
             f"Assigned below {c.strike:.2f}; breakeven {c.breakeven:.2f} "
             f"({c.cushion_pct:.1%} below spot)."
             + (f" Next earnings {c.earnings_date} (after expiry)." if c.earnings_date else "")

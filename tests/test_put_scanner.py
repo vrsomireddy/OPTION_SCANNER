@@ -244,6 +244,9 @@ def loose_config(monkeypatch):
     monkeypatch.setattr(C, "DELTA_MAX", 1.0)
     monkeypatch.setattr(C, "MIN_ANNUALIZED_RETURN", 0.0)
     monkeypatch.setattr(C, "RISK_FREE_RATE", 0.04)
+    monkeypatch.setattr(C, "MAX_COLLATERAL", None)
+    monkeypatch.setattr(C, "EXCLUDE_TICKERS", [])
+    monkeypatch.setattr(ps, "get_realized_vol", lambda tk: 0.25)
     return C
 
 
@@ -405,19 +408,48 @@ def test_scan_ticker_handles_missing_values_in_row(monkeypatch, loose_config):
 # ---------------------------------------------------------------------------
 # score
 # ---------------------------------------------------------------------------
-def test_score_ranks_best_first_and_clamps_caps(monkeypatch):
-    monkeypatch.setattr(C, "W_YIELD", 0.5)
-    monkeypatch.setattr(C, "W_SAFETY", 0.3)
-    monkeypatch.setattr(C, "W_CUSHION", 0.2)
+@pytest.fixture
+def score_config(monkeypatch):
+    """Fixed weights and bands so score arithmetic can be checked by hand."""
+    for name, value in [("W_RICHNESS", 0.4), ("W_YIELD", 0.2), ("W_SAFETY", 0.3), ("W_CUSHION", 0.1),
+                        ("DELTA_MIN", 0.15), ("DELTA_MAX", 0.25), ("IV_HV_FULL_CREDIT", 1.5)]:
+        monkeypatch.setattr(C, name, value)
 
-    low = make_candidate(ticker="LOW", annualized_return=0.10, prob_otm=0.5, cushion_pct=0.05)
-    high = make_candidate(ticker="HIGH", annualized_return=1.0, prob_otm=1.0, cushion_pct=0.50)
+
+def test_score_ranks_best_first_and_clamps_caps(score_config):
+    """Combine richness, yield, safety and cushion, clamping each part to its cap."""
+    low = make_candidate(ticker="LOW", iv_hv_ratio=1.25, annualized_return=0.10, delta=-0.25, cushion_pct=0.05)
+    high = make_candidate(ticker="HIGH", iv_hv_ratio=3.0, annualized_return=1.0, delta=-0.10, cushion_pct=0.50)
 
     ranked = ps.score([low, high])
     assert [c.ticker for c in ranked] == ["HIGH", "LOW"]
-    # HIGH's return/cushion are both above their caps, so they clamp to 1.0.
-    assert ranked[0].score == round(0.5 * 1.0 + 0.3 * 1.0 + 0.2 * 1.0, 4)
-    assert ranked[1].score == round(0.5 * (0.10 / 0.60) + 0.3 * 0.5 + 0.2 * (0.05 / 0.20), 4)
+    # HIGH is past every cap, so each part clamps to 1.0.
+    assert ranked[0].score == 1.0
+    assert ranked[1].score == round(0.4 * 0.5 + 0.2 * (0.10 / 0.60) + 0.3 * 0.0 + 0.1 * (0.05 / 0.20), 4)
+
+
+def test_score_prefers_rich_premium_over_raw_volatility(score_config):
+    """Rank a stock with unusually high option prices above one that is simply always volatile."""
+    always_wild = make_candidate(ticker="WILD", iv=0.90, iv_hv_ratio=0.95, annualized_return=0.40)
+    unusually_rich = make_candidate(ticker="RICH", iv=0.40, iv_hv_ratio=1.40, annualized_return=0.20)
+    assert [c.ticker for c in ps.score([always_wild, unusually_rich])] == ["RICH", "WILD"]
+
+
+def test_score_spreads_safety_across_the_delta_band(score_config):
+    """Give full safety credit at the low end of the delta band and none at the high end."""
+    safest, riskiest = ps.score([make_candidate(ticker="S", delta=-0.15), make_candidate(ticker="R", delta=-0.25)])
+    assert round(safest.score - riskiest.score, 4) == 0.3
+
+
+def test_score_treats_unknown_richness_as_no_credit(score_config):
+    """Score candidates saved before richness was recorded without breaking the ranking."""
+    assert ps.score([make_candidate(delta=-0.25, cushion_pct=0.0, annualized_return=0.0)])[0].score == 0.0
+
+
+def test_score_with_zero_width_delta_band(score_config, monkeypatch):
+    """Give full safety credit when the delta band is a single value."""
+    monkeypatch.setattr(C, "DELTA_MIN", 0.25)
+    assert ps.score([make_candidate(delta=-0.25, cushion_pct=0.0, annualized_return=0.0)])[0].score == 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -828,3 +860,103 @@ def test_main_reports_alternatives_changes_and_persists_selections(monkeypatch, 
     assert saved.report_group.tolist() == ["top", "alternative"]
     assert saved.comparison_date.tolist() == [str(previous_day)] * 2
     assert "Repeat contract" in saved.change_note.iloc[0]
+
+
+# ---------------------------------------------------------------------------
+# realized volatility and portfolio limits
+# ---------------------------------------------------------------------------
+def _closes(n, daily_move=0.01):
+    """Build a price series that alternates up and down by a fixed percentage."""
+    prices, p = [], 100.0
+    for i in range(n):
+        p *= 1 + (daily_move if i % 2 else -daily_move)
+        prices.append(p)
+    return pd.DataFrame({"Close": prices})
+
+
+def test_realized_vol_annualizes_daily_moves(monkeypatch):
+    """Turn a year of daily price moves into an annual volatility figure."""
+    monkeypatch.setattr(C, "HV_MIN_DAYS", 120)
+    hv = ps.get_realized_vol(FakeTicker(history_df=_closes(252)))
+    assert hv == pytest.approx(0.01 * math.sqrt(252), rel=0.02)
+
+
+def test_realized_vol_short_history_is_a_skip(monkeypatch):
+    """Skip recently listed stocks instead of reporting a data failure."""
+    monkeypatch.setattr(C, "HV_MIN_DAYS", 120)
+    with pytest.raises(ps.ScanSkipped, match="too little price history"):
+        ps.get_realized_vol(FakeTicker(history_df=_closes(50)))
+
+
+@pytest.mark.parametrize("tk", [
+    FakeTicker(history_df=_closes(252, daily_move=0)),  # flat price, zero volatility
+    FakeTicker(history_raises=True),
+    FakeTicker(history_df=pd.DataFrame()),            # no Close column
+])
+def test_realized_vol_unavailable(monkeypatch, tk):
+    """Report no volatility when the price history is missing, short, or flat."""
+    monkeypatch.setattr(C, "HV_MIN_DAYS", 120)
+    assert ps.get_realized_vol(tk) is None
+
+
+def test_scan_records_iv_to_realized_vol_ratio(monkeypatch, loose_config):
+    """Store each contract's implied vol relative to the stock's realized vol."""
+    c = _scan_with_row(monkeypatch, make_put_row(impliedVolatility=0.30))[0]
+    assert (c.hv, c.iv_hv_ratio) == (0.25, 1.2)
+
+
+def test_scan_without_realized_vol_reports_failure(monkeypatch, loose_config):
+    """Treat missing volatility history as a data failure, not a silent pass."""
+    monkeypatch.setattr(ps, "get_realized_vol", lambda tk: None)
+    with pytest.raises(ps.ScanDataError, match="realized volatility unavailable"):
+        _scan_with_row(monkeypatch, make_put_row())
+
+
+def test_scan_skips_excluded_tickers_before_fetching(monkeypatch, loose_config):
+    """Skip configured names without requesting any market data."""
+    monkeypatch.setattr(C, "EXCLUDE_TICKERS", ["AAA"])
+    monkeypatch.setattr(ps.yf, "Ticker", lambda symbol: pytest.fail("should not fetch"))
+    with pytest.raises(ps.ScanSkipped, match="excluded in config"):
+        ps.scan_ticker("AAA", date.today())
+
+
+def test_scan_drops_contracts_above_collateral_limit(monkeypatch, loose_config):
+    """Leave out puts that would tie up more cash than the configured limit."""
+    monkeypatch.setattr(C, "MAX_COLLATERAL", 8_000)
+    assert _scan_with_row(monkeypatch, make_put_row(strike=90.0)) == []
+    monkeypatch.setattr(C, "MAX_COLLATERAL", 9_000)
+    assert len(_scan_with_row(monkeypatch, make_put_row(strike=90.0))) == 1
+
+
+def test_sector_group_limit_applies_across_picks_and_alternatives(monkeypatch):
+    """Show at most the configured number of names from one sector group in the whole report."""
+    monkeypatch.setattr(C, "SECTOR_GROUPS", {"Chips": ["AAA", "BBB", "CCC"]})
+    monkeypatch.setattr(C, "MAX_PER_GROUP", 1)
+    monkeypatch.setattr(C, "MAX_PER_TICKER", 2)
+    monkeypatch.setattr(C, "TOP_N", 3)
+    monkeypatch.setattr(C, "ALTERNATIVE_N", 3)
+    ranked = [make_candidate(ticker=t) for t in ["AAA", "AAA", "BBB", "DDD", "CCC", "EEE", "FFF"]]
+    picks = ps.pick_top(ranked)
+    assert [c.ticker for c in picks] == ["AAA", "AAA", "DDD"]   # second contract of a shown name is still allowed
+    assert [c.ticker for c in ps.pick_alternatives(ranked, picks)] == ["EEE", "FFF"]
+
+
+def test_report_shows_richness_and_limits(monkeypatch):
+    """Explain the richness figure and active portfolio limits in the report."""
+    monkeypatch.setattr(C, "MAX_COLLATERAL", 30_000)
+    monkeypatch.setattr(C, "SECTOR_GROUPS", {"Semiconductors": ["AAA"]})
+    monkeypatch.setattr(C, "MAX_PER_GROUP", 1)
+    md = ps.to_markdown([make_candidate(iv=0.3, hv=0.25, iv_hv_ratio=1.2)], 1, 1, datetime(2026, 9, 30))
+    assert "collateral ≤ $30,000" in md
+    assert "≤1 Semiconductors" in md
+    assert "IV 30% vs 25% realized (1.20x)" in md
+    assert "| 1.20 |" in md
+
+
+def test_previous_scan_loads_files_written_before_richness_existed(tmp_path):
+    """Keep comparing against older reports that lack the new volatility columns."""
+    legacy = {k: v for k, v in asdict(make_candidate(ticker="OLD")).items() if k not in ps.OPTIONAL_FIELDS}
+    pd.DataFrame([dict(legacy, report_group="top")]).to_csv(tmp_path / "all_candidates_2026-09-10.csv", index=False)
+    previous = ps.load_previous_scan(tmp_path, date(2026, 9, 11))
+    assert [c.ticker for c in previous.displayed] == ["OLD"]
+    assert math.isnan(previous.candidates[0].iv_hv_ratio)
