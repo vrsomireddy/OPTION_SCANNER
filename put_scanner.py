@@ -2,7 +2,8 @@
 """
 Daily cash-secured put scanner for Nasdaq-100 tech names.
 
-Suggestions only. This script never connects to a broker and never places orders.
+Suggestions only. This script never places orders. It reads implied-volatility
+history from Interactive Brokers over a read-only API connection.
 
 Pipeline
   1. Pull fresh quotes + option chains from Yahoo Finance (yfinance).
@@ -11,7 +12,9 @@ Pipeline
      pull the put chain and compute Black-Scholes delta from implied vol.
   4. Keep puts in the delta band with acceptable spread/OI and a bid that
      clears the annualized-return hurdle on cash collateral.
-  5. Score, rank, keep the best contract per ticker, print top N,
+  5. For stocks with candidates, look up where today's implied vol sits in
+     its past year (IBKR IV percentile).
+  6. Score, rank, keep the best contract per ticker, print top N,
      write a markdown report, and optionally email/SMS it.
 """
 
@@ -30,6 +33,7 @@ from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
+from ib_async import IB, StartupFetch, Stock
 from scipy.stats import norm
 
 import config as C
@@ -68,6 +72,7 @@ class PutCandidate:
     prob_otm: float             # 1 - |delta|
     earnings_date: str | None
     score: float = 0.0
+    iv_percentile: float = float("nan")  # share of past-year days with lower stock IV (IBKR); high = rich premium
 
 
 class ScanDataError(Exception):
@@ -149,10 +154,61 @@ def get_next_earnings(tk: yf.Ticker, today: date | None = None) -> date | None:
 
 
 # ---------------------------------------------------------------------------
+# IBKR implied-volatility history (read-only; no order code in this project)
+# ---------------------------------------------------------------------------
+def connect_ibkr() -> IB | None:
+    """Open a read-only market data connection to a running IB Gateway or TWS, if one is available."""
+    ib = IB()
+    try:
+        ib.connect(C.IBKR_HOST, C.IBKR_PORT, clientId=C.IBKR_CLIENT_ID, timeout=C.IBKR_TIMEOUT,
+                   readonly=True, fetchFields=StartupFetch(0))
+    except Exception as e:
+        log.error("IBKR connection to %s:%s failed (%s); is IB Gateway/TWS running with the API enabled?",
+                  C.IBKR_HOST, C.IBKR_PORT, e)
+        return None
+    return ib
+
+
+def get_iv_percentile(ib: IB, symbol: str) -> float | None:
+    """Tell how today's implied volatility compares with the stock's past year, from 0 (lowest) to 1 (highest)."""
+    try:
+        contract = Stock(symbol, "SMART", "USD")
+        if not ib.qualifyContracts(contract):
+            return None
+        bars = ib.reqHistoricalData(contract, endDateTime="", durationStr=C.IV_LOOKBACK, barSizeSetting="1 day",
+                                    whatToShow="OPTION_IMPLIED_VOLATILITY", useRTH=True)
+        ivs = [b.close for b in bars or [] if b.close is not None and math.isfinite(b.close) and b.close > 0]
+    except Exception as e:
+        log.warning("%s: IBKR IV history failed (%s)", symbol, e)
+        return None
+    if not ivs:
+        return None
+    if len(ivs) < C.IV_MIN_DAYS:
+        raise ScanSkipped("too little implied volatility history")
+    today_iv, past = ivs[-1], ivs[:-1]
+    return sum(v < today_iv for v in past) / len(past)
+
+
+def add_iv_percentile(ib: IB | None, symbol: str, found: list[PutCandidate]) -> None:
+    """Attach the stock's IV percentile to its candidates or explain why it could not be found."""
+    if not found:
+        return
+    if ib is None:
+        raise ScanDataError("IV history unavailable: IBKR not connected")
+    pct = get_iv_percentile(ib, symbol)
+    if pct is None:
+        raise ScanDataError("IV history unavailable from IBKR")
+    for c in found:
+        c.iv_percentile = round(pct, 3)
+
+
+# ---------------------------------------------------------------------------
 # Scan
 # ---------------------------------------------------------------------------
 def scan_ticker(symbol: str, today: date) -> list[PutCandidate]:
     """Find qualifying puts for one stock or explain why it could not be evaluated."""
+    if symbol in C.EXCLUDE_TICKERS:
+        raise ScanSkipped("excluded in config")
     tk = yf.Ticker(symbol)
     spot, avg_vol = get_spot_and_volume(tk)
     if spot is None or not math.isfinite(spot) or spot <= 0:
@@ -207,6 +263,8 @@ def scan_ticker(symbol: str, today: date) -> list[PutCandidate]:
 
             if strike >= spot:            # OTM puts only
                 continue
+            if C.MAX_COLLATERAL and strike * 100 > C.MAX_COLLATERAL:
+                continue
             if bid < C.MIN_BID or ask <= 0 or ask < bid:
                 continue
             if oi < C.MIN_OPEN_INTEREST:
@@ -256,21 +314,38 @@ def scan_ticker(symbol: str, today: date) -> list[PutCandidate]:
 
 def score(cands: list[PutCandidate]) -> list[PutCandidate]:
     """Rate and rank each candidate by how attractive a trade it is, best first."""
+    band = C.DELTA_MAX - C.DELTA_MIN
     for c in cands:
+        rich = c.iv_percentile if math.isfinite(c.iv_percentile) else 0.0   # unknown earns no richness credit
         y = min(c.annualized_return, 0.60) / 0.60
-        s = c.prob_otm
+        s = min(max((C.DELTA_MAX - abs(c.delta)) / band, 0.0), 1.0) if band > 0 else 1.0
         cu = min(c.cushion_pct, 0.20) / 0.20
-        c.score = round(C.W_YIELD * y + C.W_SAFETY * s + C.W_CUSHION * cu, 4)
+        c.score = round(C.W_RICHNESS * rich + C.W_YIELD * y + C.W_SAFETY * s + C.W_CUSHION * cu, 4)
     cands.sort(key=lambda c: c.score, reverse=True)
     return cands
 
 
+def sector_group(ticker: str) -> str | None:
+    """Name the configured sector group a stock belongs to, if any."""
+    return next((name for name, members in C.SECTOR_GROUPS.items() if ticker in members), None)
+
+
+def group_is_full(ticker: str, shown: list[PutCandidate]) -> bool:
+    """Tell whether the stock's sector group already has its maximum number of names shown."""
+    group = sector_group(ticker)
+    if group is None:
+        return False
+    return len({c.ticker for c in shown if sector_group(c.ticker) == group}) >= C.MAX_PER_GROUP
+
+
 def pick_top(cands: list[PutCandidate]) -> list[PutCandidate]:
-    """Select the day's best suggestions, limiting how many come from the same stock."""
+    """Select the day's best suggestions, limiting repeats of the same stock or sector group."""
     seen: dict[str, int] = {}
     picks = []
     for c in cands:
         if seen.get(c.ticker, 0) >= C.MAX_PER_TICKER:
+            continue
+        if c.ticker not in seen and group_is_full(c.ticker, picks):
             continue
         seen[c.ticker] = seen.get(c.ticker, 0) + 1
         picks.append(c)
@@ -280,13 +355,13 @@ def pick_top(cands: list[PutCandidate]) -> list[PutCandidate]:
 
 
 def pick_alternatives(ranked: list[PutCandidate], picks: list[PutCandidate]) -> list[PutCandidate]:
-    """Choose additional qualifying stocks in score order without repeating a name."""
+    """Choose additional qualifying stocks in score order without repeating a name or overfilling a sector group."""
     seen = {c.ticker for c in picks}
     alternatives = []
     for c in ranked:
         if len(alternatives) >= C.ALTERNATIVE_N:
             break
-        if c.ticker not in seen:
+        if c.ticker not in seen and not group_is_full(c.ticker, picks + alternatives):
             alternatives.append(c)
             seen.add(c.ticker)
     return alternatives
@@ -297,6 +372,9 @@ def contract_key(c: PutCandidate) -> tuple[str, str, float]:
     return c.ticker, c.expiration, c.strike
 
 
+OPTIONAL_FIELDS = {"iv_percentile"}   # absent from reports written before these were recorded
+
+
 def load_previous_scan(out_dir: Path, today: date) -> PreviousScan | None:
     """Read the latest usable earlier daily results for comparison."""
     for path in sorted(out_dir.glob("all_candidates_*.csv"), reverse=True):
@@ -305,7 +383,7 @@ def load_previous_scan(out_dir: Path, today: date) -> PreviousScan | None:
             if day >= today:
                 continue
             df = pd.read_csv(path)
-            names = [field.name for field in fields(PutCandidate)]
+            names = [field.name for field in fields(PutCandidate) if field.name in df or field.name not in OPTIONAL_FIELDS]
             records = df[names].to_dict("records")
             candidates = [PutCandidate(**row) for row in records]
             for c in candidates:
@@ -365,7 +443,9 @@ def to_markdown(
         f"Filters: |Δ| {C.DELTA_MIN:.2f}–{C.DELTA_MAX:.2f} · DTE {C.DTE_MIN}–{C.DTE_MAX} · "
         f"≥{C.MIN_ANNUALIZED_RETURN:.0%} annualized · OI ≥ {C.MIN_OPEN_INTEREST} · "
         f"spread ≤ {C.MAX_SPREAD_PCT:.0%}"
-        + (" · earnings skipped" if C.SKIP_EARNINGS else ""),
+        + (" · earnings skipped" if C.SKIP_EARNINGS else "")
+        + (f" · collateral ≤ ${C.MAX_COLLATERAL:,.0f}" if C.MAX_COLLATERAL else "")
+        + "".join(f" · ≤{C.MAX_PER_GROUP} {name}" for name in C.SECTOR_GROUPS),
         "",
     ]
     if skipped:
@@ -382,13 +462,15 @@ def to_markdown(
         return "\n".join(lines)
 
     lines += [
-        "| # | Ticker | Spot | Exp | DTE | Strike | Bid | Δ | P(OTM) | Cushion | Ann. Ret | Premium/ct | Collateral | Breakeven | Score |",
-        "|---|--------|------|-----|-----|--------|-----|---|--------|---------|----------|------------|------------|-----------|-------|",
+        "| # | Ticker | Spot | Exp | DTE | Strike | Bid | Δ | P(OTM) | Cushion | IV pct "
+        "| Ann. Ret | Premium/ct | Collateral | Breakeven | Score |",
+        "|---|--------|------|-----|-----|--------|-----|---|--------|---------|-------"
+        "|----------|------------|------------|-----------|-------|",
     ]
     for i, c in enumerate(picks, 1):
         lines.append(
             f"| {i} | **{c.ticker}** | {c.spot:.2f} | {c.expiration} | {c.dte} | {c.strike:.2f} | "
-            f"{c.bid:.2f} | {c.delta:.2f} | {c.prob_otm:.0%} | {c.cushion_pct:.1%} | "
+            f"{c.bid:.2f} | {c.delta:.2f} | {c.prob_otm:.0%} | {c.cushion_pct:.1%} | {c.iv_percentile:.0%} | "
             f"{c.annualized_return:.1%} | ${c.premium_per_contract:,.0f} | ${c.collateral:,.0f} | "
             f"{c.breakeven:.2f} | {c.score:.3f} |"
         )
@@ -397,7 +479,7 @@ def to_markdown(
         lines.append(
             f"{i}. **SELL TO OPEN 1 {c.ticker} {c.expiration} {str(c.strike).removesuffix('.0')}P @ {c.bid:.2f} (limit)**: "
             f"collect ~${c.premium_per_contract:,.0f} against ${c.collateral:,.0f} cash. "
-            f"IV {c.iv:.0%}, OI {c.open_interest:,}, spread {c.spread_pct:.1%}. "
+            f"IV {c.iv:.0%}, higher than on {c.iv_percentile:.0%} of past-year days, OI {c.open_interest:,}, spread {c.spread_pct:.1%}. "
             f"Assigned below {c.strike:.2f}; breakeven {c.breakeven:.2f} "
             f"({c.cushion_pct:.1%} below spot)."
             + (f" Next earnings {c.earnings_date} (after expiry)." if c.earnings_date else "")
@@ -489,9 +571,11 @@ def main() -> int:
     failures: dict[str, str] = {}
     skipped: dict[str, str] = {}
 
+    ib = connect_ibkr()
     for sym in C.UNIVERSE:
         try:
             found = scan_ticker(sym, today)
+            add_iv_percentile(ib, sym, found)
             scanned += 1
             log.info("%s: %d candidates", sym, len(found))
             all_cands.extend(found)
@@ -501,6 +585,8 @@ def main() -> int:
             failures[sym] = str(e)
             log.error("%s: scan failed: %s", sym, e)
         time.sleep(0.3)  # be polite to Yahoo
+    if ib is not None:
+        ib.disconnect()
 
     ranked = score(all_cands)
     picks = pick_top(ranked)

@@ -1,30 +1,41 @@
 # Daily Cash-Secured Put Scanner (Nasdaq-100 Tech)
 
-Suggestions only. No broker connection, no order placement.
+Suggestions only. No order placement. Reads implied-volatility history from
+Interactive Brokers over a read-only API connection (see [IBKR setup](#ibkr-setup)).
 
 ## What it does
 
 Each run:
-1. Pulls fresh quotes and option chains from Yahoo Finance for the tickers in `config.py`.
+1. Pulls fresh quotes and option chains from Yahoo Finance for the tickers in `config.py`,
+   skipping any listed in `EXCLUDE_TICKERS` (e.g. stocks you already hold).
 2. Drops underlyings with thin volume (`MIN_AVG_STOCK_VOLUME`, 1M shares/day) or
    priced above `MAX_STOCK_PRICE` — that price cap is currently `None`, i.e. disabled.
 3. Looks at every expiration 21–45 DTE, skipping any that spans the next earnings date.
    Stocks with unknown earnings dates or missing required average volume are excluded
    and recorded as data failures.
 4. For each OTM put: computes Black-Scholes delta from the quoted implied vol,
-   keeps |Δ| 0.15–0.25, OI ≥ 500, bid ≥ $0.20, bid-ask ≤ 10%, and **annualized return on
-   collateral ≥ 15%** where `annualized = bid / strike × 365 / DTE`.
-5. Scores, ranks, keeps the best contract per ticker, and outputs the top 5.
-6. Adds up to 5 alternative names, in score order, excluding all top-pick tickers.
-7. Compares recommendations with the latest usable earlier daily report.
+   keeps |Δ| 0.15–0.25, OI ≥ 500, bid ≥ $0.20, bid-ask ≤ 10%, collateral ≤ `MAX_COLLATERAL`
+   ($30,000), and **annualized return on collateral ≥ 15%** where `annualized = bid / strike × 365 / DTE`.
+5. For each stock that still has candidates, asks IBKR for a year of daily implied
+   volatility and records the **IV percentile**: the share of past-year days on which the
+   stock's IV was lower than today. Stocks with under `IV_MIN_DAYS` (120) of IV history are skipped.
+6. Scores, ranks, keeps the best contract per ticker, and outputs the top 5, with at most
+   `MAX_PER_GROUP` names from each `SECTOR_GROUPS` group (default: 1 semiconductor).
+7. Adds up to 5 alternative names, in score order, excluding all top-pick tickers. The
+   sector-group limit counts top picks and alternatives together.
+8. Compares recommendations with the latest usable earlier daily report.
 
 ### Scoring (deterministic)
 
 ```
-score = 0.45 × min(annualized, 60%)/60%      # yield
-      + 0.35 × (1 − |delta|)                  # ≈ probability of expiring OTM
-      + 0.20 × min(cushion, 20%)/20%          # % distance spot → strike
+score = 0.40 × IV percentile                          # premium rich vs the stock's own past year
+      + 0.20 × min(annualized, 60%)/60%                # yield
+      + 0.30 × (DELTA_MAX − |delta|)/(DELTA_MAX − DELTA_MIN)   # safer end of the delta band
+      + 0.10 × min(cushion, 20%)/20%                   # % distance spot → strike
 ```
+Raw yield rises with volatility, so on its own it favors names that are always volatile.
+The IV percentile instead rewards selling when options are expensive *for that stock*.
+The safety term is rescaled to the delta band so it actually separates candidates.
 Weights live in `config.py`. Same inputs → same output, always.
 
 ### Output
@@ -76,6 +87,23 @@ python3 -m venv venv
 cp .env.example .env      # edit if you want email/SMS; otherwise leave as is
 ./venv/bin/python put_scanner.py   # test run, ~3 min for the full universe
 ```
+
+## IBKR setup
+
+The scan needs IB Gateway (or TWS) running and logged in when it starts.
+
+1. In Gateway: Configure → Settings → API → Settings: enable **ActiveX and Socket Clients**,
+   tick **Read-Only API**, and note the socket port (Gateway live 4001, paper 4002; TWS 7496/7497).
+   Set `IBKR_PORT` in `config.py` to match.
+2. Market data: historical implied volatility needs the stock and options (OPRA) data
+   subscriptions on the account.
+3. Gateway restarts daily and asks for two-factor login about weekly. Set the daily auto-restart
+   time outside 10:00 ET, and log in again when prompted, or the scan cannot reach it.
+
+The connection is opened with `readonly=True` and does not download positions, orders, or
+balances. The project contains no order code. If Gateway is unreachable, every stock with
+candidates is reported as a data failure and the run is marked INCOMPLETE, so the scanner never
+ranks picks without IV history.
 
 ## Email / SMS
 
@@ -133,8 +161,10 @@ The script has no Mac dependencies.
 ## Tuning
 
 All knobs are in `config.py`. Common tweaks:
-- Set `MAX_STOCK_PRICE` to a number (e.g. `300`) to cap collateral per contract. It is
-  `None` today, so high-priced names like SNDK can demand six figures of collateral.
+- `MAX_COLLATERAL` caps cash per contract (default $30,000; `None` removes it).
+  `MAX_STOCK_PRICE` can additionally drop whole stocks above a price.
+- `EXCLUDE_TICKERS` lists names never to suggest. Keep it in step with what you hold.
+- Add groups to `SECTOR_GROUPS` (e.g. AI cloud: CRWV, NBIS) or raise `MAX_PER_GROUP`.
 - Lower `MIN_ANNUALIZED_RETURN` in low-IV markets or you may get an empty list.
 - Raise `MAX_SPREAD_PCT` above 0.10 if wide-market names are being filtered out.
 - `MAX_PER_TICKER = 2` to see two expirations per name.
@@ -143,6 +173,8 @@ All knobs are in `config.py`. Common tweaks:
 
 ## Caveats
 - Yahoo data is ~15 min delayed and occasionally stale/missing; treat bids as approximate and confirm on IBKR before entering an order.
+- IV percentile comes from IBKR's daily stock-level implied volatility; per-contract IV and delta
+  still come from Yahoo.
 - Delta is computed from Yahoo's IV, not read from the exchange, so it can differ slightly from your broker's Greeks.
 - The scan runs on market holidays too and will email a report built from the previous session's stale quotes. Check the date before acting on a holiday-morning email.
 - Not financial advice.

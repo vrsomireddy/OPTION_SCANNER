@@ -84,6 +84,34 @@ class FakeTicker:
         return self._option_chains[exp_str]
 
 
+class Bar:
+    def __init__(self, close):
+        self.close = close
+
+
+class FakeIB:
+    """Stands in for an IBKR connection so tests never open a socket."""
+
+    def __init__(self, ivs=(), qualify=True, raises=False):
+        self.ivs = list(ivs)
+        self.qualify = qualify
+        self.raises = raises
+        self.requests = []
+        self.disconnected = False
+
+    def qualifyContracts(self, contract):
+        if self.raises:
+            raise RuntimeError("pacing violation")
+        return [contract] if self.qualify else []
+
+    def reqHistoricalData(self, contract, **kwargs):
+        self.requests.append((contract.symbol, kwargs["whatToShow"]))
+        return [Bar(v) for v in self.ivs]
+
+    def disconnect(self):
+        self.disconnected = True
+
+
 def make_put_row(**overrides):
     row = dict(strike=90.0, bid=1.0, ask=1.1, impliedVolatility=0.30, openInterest=100, volume=50)
     row.update(overrides)
@@ -244,6 +272,8 @@ def loose_config(monkeypatch):
     monkeypatch.setattr(C, "DELTA_MAX", 1.0)
     monkeypatch.setattr(C, "MIN_ANNUALIZED_RETURN", 0.0)
     monkeypatch.setattr(C, "RISK_FREE_RATE", 0.04)
+    monkeypatch.setattr(C, "MAX_COLLATERAL", None)
+    monkeypatch.setattr(C, "EXCLUDE_TICKERS", [])
     return C
 
 
@@ -405,19 +435,48 @@ def test_scan_ticker_handles_missing_values_in_row(monkeypatch, loose_config):
 # ---------------------------------------------------------------------------
 # score
 # ---------------------------------------------------------------------------
-def test_score_ranks_best_first_and_clamps_caps(monkeypatch):
-    monkeypatch.setattr(C, "W_YIELD", 0.5)
-    monkeypatch.setattr(C, "W_SAFETY", 0.3)
-    monkeypatch.setattr(C, "W_CUSHION", 0.2)
+@pytest.fixture
+def score_config(monkeypatch):
+    """Fixed weights and bands so score arithmetic can be checked by hand."""
+    for name, value in [("W_RICHNESS", 0.4), ("W_YIELD", 0.2), ("W_SAFETY", 0.3), ("W_CUSHION", 0.1),
+                        ("DELTA_MIN", 0.15), ("DELTA_MAX", 0.25)]:
+        monkeypatch.setattr(C, name, value)
 
-    low = make_candidate(ticker="LOW", annualized_return=0.10, prob_otm=0.5, cushion_pct=0.05)
-    high = make_candidate(ticker="HIGH", annualized_return=1.0, prob_otm=1.0, cushion_pct=0.50)
+
+def test_score_ranks_best_first_and_clamps_caps(score_config):
+    """Combine richness, yield, safety and cushion, clamping each part to its cap."""
+    low = make_candidate(ticker="LOW", iv_percentile=0.5, annualized_return=0.10, delta=-0.25, cushion_pct=0.05)
+    high = make_candidate(ticker="HIGH", iv_percentile=1.0, annualized_return=1.0, delta=-0.10, cushion_pct=0.50)
 
     ranked = ps.score([low, high])
     assert [c.ticker for c in ranked] == ["HIGH", "LOW"]
-    # HIGH's return/cushion are both above their caps, so they clamp to 1.0.
-    assert ranked[0].score == round(0.5 * 1.0 + 0.3 * 1.0 + 0.2 * 1.0, 4)
-    assert ranked[1].score == round(0.5 * (0.10 / 0.60) + 0.3 * 0.5 + 0.2 * (0.05 / 0.20), 4)
+    # HIGH is past every cap, so each part clamps to 1.0.
+    assert ranked[0].score == 1.0
+    assert ranked[1].score == round(0.4 * 0.5 + 0.2 * (0.10 / 0.60) + 0.3 * 0.0 + 0.1 * (0.05 / 0.20), 4)
+
+
+def test_score_prefers_rich_premium_over_raw_volatility(score_config):
+    """Rank a stock with unusually high option prices above one that is simply always volatile."""
+    always_wild = make_candidate(ticker="WILD", iv=0.90, iv_percentile=0.10, annualized_return=0.40)
+    unusually_rich = make_candidate(ticker="RICH", iv=0.40, iv_percentile=0.90, annualized_return=0.20)
+    assert [c.ticker for c in ps.score([always_wild, unusually_rich])] == ["RICH", "WILD"]
+
+
+def test_score_spreads_safety_across_the_delta_band(score_config):
+    """Give full safety credit at the low end of the delta band and none at the high end."""
+    safest, riskiest = ps.score([make_candidate(ticker="S", delta=-0.15), make_candidate(ticker="R", delta=-0.25)])
+    assert round(safest.score - riskiest.score, 4) == 0.3
+
+
+def test_score_treats_unknown_richness_as_no_credit(score_config):
+    """Score candidates saved before richness was recorded without breaking the ranking."""
+    assert ps.score([make_candidate(delta=-0.25, cushion_pct=0.0, annualized_return=0.0)])[0].score == 0.0
+
+
+def test_score_with_zero_width_delta_band(score_config, monkeypatch):
+    """Give full safety credit when the delta band is a single value."""
+    monkeypatch.setattr(C, "DELTA_MIN", 0.25)
+    assert ps.score([make_candidate(delta=-0.25, cushion_pct=0.0, annualized_return=0.0)])[0].score == 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +591,8 @@ def main_env(monkeypatch, tmp_path):
     monkeypatch.setattr(C, "UNIVERSE", ["AAA", "BBB"])
     monkeypatch.delenv("EMAIL_TO", raising=False)
     monkeypatch.delenv("SMS_TO", raising=False)
+    monkeypatch.setattr(C, "IV_MIN_DAYS", 3)
+    monkeypatch.setattr(ps, "connect_ibkr", lambda: FakeIB(ivs=[0.2, 0.3, 0.4, 0.5, 0.45]))
     return tmp_path
 
 
@@ -828,3 +889,136 @@ def test_main_reports_alternatives_changes_and_persists_selections(monkeypatch, 
     assert saved.report_group.tolist() == ["top", "alternative"]
     assert saved.comparison_date.tolist() == [str(previous_day)] * 2
     assert "Repeat contract" in saved.change_note.iloc[0]
+
+
+# ---------------------------------------------------------------------------
+# realized volatility and portfolio limits
+# ---------------------------------------------------------------------------
+def test_iv_percentile_compares_today_with_past_year(monkeypatch):
+    """Place today's implied vol among the stock's earlier daily values."""
+    monkeypatch.setattr(C, "IV_MIN_DAYS", 3)
+    ib = FakeIB(ivs=[0.2, 0.3, 0.4, float("nan"), 0.6, 0.35])
+    assert ps.get_iv_percentile(ib, "AAA") == 0.5
+    assert ib.requests == [("AAA", "OPTION_IMPLIED_VOLATILITY")]
+
+
+def test_iv_percentile_short_history_is_a_skip(monkeypatch):
+    """Skip recently listed stocks instead of reporting a data failure."""
+    monkeypatch.setattr(C, "IV_MIN_DAYS", 10)
+    with pytest.raises(ps.ScanSkipped, match="too little implied volatility history"):
+        ps.get_iv_percentile(FakeIB(ivs=[0.2, 0.3]), "AAA")
+
+
+@pytest.mark.parametrize("ib", [FakeIB(ivs=[]), FakeIB(ivs=[0.3] * 5, qualify=False), FakeIB(raises=True)])
+def test_iv_percentile_unavailable(ib):
+    """Report no percentile when IBKR has no history, no matching stock, or errors."""
+    assert ps.get_iv_percentile(ib, "AAA") is None
+
+
+def test_add_iv_percentile_labels_candidates_and_failures(monkeypatch):
+    """Attach the percentile to every contract and fail the stock when it cannot be found."""
+    monkeypatch.setattr(C, "IV_MIN_DAYS", 3)
+    found = [make_candidate(), make_candidate(strike=85)]
+    ps.add_iv_percentile(FakeIB(ivs=[0.2, 0.3, 0.4, 0.5, 0.45]), "AAA", found)
+    assert [c.iv_percentile for c in found] == [0.75, 0.75]
+    ps.add_iv_percentile(None, "AAA", [])   # no candidates, nothing to look up
+    with pytest.raises(ps.ScanDataError, match="IBKR not connected"):
+        ps.add_iv_percentile(None, "AAA", found)
+    with pytest.raises(ps.ScanDataError, match="unavailable from IBKR"):
+        ps.add_iv_percentile(FakeIB(), "AAA", found)
+
+
+def test_connect_ibkr_is_read_only_and_skips_account_data(monkeypatch):
+    """Connect without order permissions or downloading positions, orders, or balances."""
+    calls = {}
+
+    class FakeClient:
+        def connect(self, host, port, **kwargs):
+            calls.update(kwargs, host=host, port=port)
+
+    monkeypatch.setattr(ps, "IB", FakeClient)
+    assert isinstance(ps.connect_ibkr(), FakeClient)
+    assert calls["readonly"] is True
+    assert calls["fetchFields"] == ps.StartupFetch(0)
+    assert (calls["host"], calls["port"]) == (C.IBKR_HOST, C.IBKR_PORT)
+
+
+def test_connect_ibkr_failure_returns_none(monkeypatch):
+    """Carry on without IBKR when the gateway is not running."""
+    class DownClient:
+        def connect(self, *a, **k):
+            raise ConnectionRefusedError("refused")
+
+    monkeypatch.setattr(ps, "IB", DownClient)
+    assert ps.connect_ibkr() is None
+
+
+def test_main_without_ibkr_marks_stocks_with_candidates_incomplete(monkeypatch, main_env, capsys):
+    """Never rank picks without IV history; label the run incomplete instead."""
+    monkeypatch.setattr(ps.sys, "argv", ["put_scanner.py"])
+    monkeypatch.setattr(ps, "connect_ibkr", lambda: None)
+    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today: [make_candidate(ticker=symbol)])
+    assert ps.main() == 1
+    report = capsys.readouterr().out
+    assert "IBKR not connected" in report
+    assert "INCOMPLETE SCAN" in report
+
+
+def test_main_disconnects_from_ibkr(monkeypatch, main_env):
+    """Close the IBKR connection when the scan finishes."""
+    monkeypatch.setattr(ps.sys, "argv", ["put_scanner.py"])
+    ib = FakeIB(ivs=[0.2, 0.3, 0.4, 0.5])
+    monkeypatch.setattr(ps, "connect_ibkr", lambda: ib)
+    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today: [make_candidate(ticker=symbol)])
+    assert ps.main() == 0
+    assert ib.disconnected
+
+
+def test_scan_skips_excluded_tickers_before_fetching(monkeypatch, loose_config):
+    """Skip configured names without requesting any market data."""
+    monkeypatch.setattr(C, "EXCLUDE_TICKERS", ["AAA"])
+    monkeypatch.setattr(ps.yf, "Ticker", lambda symbol: pytest.fail("should not fetch"))
+    with pytest.raises(ps.ScanSkipped, match="excluded in config"):
+        ps.scan_ticker("AAA", date.today())
+
+
+def test_scan_drops_contracts_above_collateral_limit(monkeypatch, loose_config):
+    """Leave out puts that would tie up more cash than the configured limit."""
+    monkeypatch.setattr(C, "MAX_COLLATERAL", 8_000)
+    assert _scan_with_row(monkeypatch, make_put_row(strike=90.0)) == []
+    monkeypatch.setattr(C, "MAX_COLLATERAL", 9_000)
+    assert len(_scan_with_row(monkeypatch, make_put_row(strike=90.0))) == 1
+
+
+def test_sector_group_limit_applies_across_picks_and_alternatives(monkeypatch):
+    """Show at most the configured number of names from one sector group in the whole report."""
+    monkeypatch.setattr(C, "SECTOR_GROUPS", {"Chips": ["AAA", "BBB", "CCC"]})
+    monkeypatch.setattr(C, "MAX_PER_GROUP", 1)
+    monkeypatch.setattr(C, "MAX_PER_TICKER", 2)
+    monkeypatch.setattr(C, "TOP_N", 3)
+    monkeypatch.setattr(C, "ALTERNATIVE_N", 3)
+    ranked = [make_candidate(ticker=t) for t in ["AAA", "AAA", "BBB", "DDD", "CCC", "EEE", "FFF"]]
+    picks = ps.pick_top(ranked)
+    assert [c.ticker for c in picks] == ["AAA", "AAA", "DDD"]   # second contract of a shown name is still allowed
+    assert [c.ticker for c in ps.pick_alternatives(ranked, picks)] == ["EEE", "FFF"]
+
+
+def test_report_shows_richness_and_limits(monkeypatch):
+    """Explain the richness figure and active portfolio limits in the report."""
+    monkeypatch.setattr(C, "MAX_COLLATERAL", 30_000)
+    monkeypatch.setattr(C, "SECTOR_GROUPS", {"Semiconductors": ["AAA"]})
+    monkeypatch.setattr(C, "MAX_PER_GROUP", 1)
+    md = ps.to_markdown([make_candidate(iv=0.3, iv_percentile=0.82)], 1, 1, datetime(2026, 9, 30))
+    assert "collateral ≤ $30,000" in md
+    assert "≤1 Semiconductors" in md
+    assert "IV 30%, higher than on 82% of past-year days" in md
+    assert "| 82% |" in md
+
+
+def test_previous_scan_loads_files_written_before_richness_existed(tmp_path):
+    """Keep comparing against older reports that lack the new volatility columns."""
+    legacy = {k: v for k, v in asdict(make_candidate(ticker="OLD")).items() if k not in ps.OPTIONAL_FIELDS}
+    pd.DataFrame([dict(legacy, report_group="top")]).to_csv(tmp_path / "all_candidates_2026-09-10.csv", index=False)
+    previous = ps.load_previous_scan(tmp_path, date(2026, 9, 11))
+    assert [c.ticker for c in previous.displayed] == ["OLD"]
+    assert math.isnan(previous.candidates[0].iv_percentile)

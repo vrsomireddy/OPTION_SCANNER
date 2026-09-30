@@ -33,6 +33,31 @@ SKIP_EARNINGS = True        # drop expirations that span an earnings date
 RISK_FREE_RATE = 0.04       # used in Black-Scholes delta
 
 # ---------------------------------------------------------------------------
+# Premium richness: where today's implied vol sits in the stock's past year.
+# Read from IBKR (IB Gateway or TWS must be running with the API enabled).
+# Gateway live port 4001, paper 4002; TWS live 7496, paper 7497.
+# ---------------------------------------------------------------------------
+IBKR_HOST = "127.0.0.1"
+IBKR_PORT = 4001
+IBKR_CLIENT_ID = 17         # any id not used by another API client
+IBKR_TIMEOUT = 10           # seconds to wait for the connection
+IV_LOOKBACK = "1 Y"         # implied-volatility history window
+IV_MIN_DAYS = 120           # fewer daily IV values than this = stock skipped
+
+# ---------------------------------------------------------------------------
+# Portfolio limits
+# ---------------------------------------------------------------------------
+MAX_COLLATERAL = 30_000     # max cash per contract (strike x 100); None = no limit
+EXCLUDE_TICKERS = ["INTC", "MRVL", "MU"]   # never suggest (e.g. names already held)
+MAX_PER_GROUP = 1           # max displayed names (top picks + alternatives) per group below
+SECTOR_GROUPS = {
+    "Semiconductors": [
+        "ADI", "ALAB", "AMAT", "AMD", "ARM", "ASML", "AVGO", "INTC", "KLAC", "LRCX", "MCHP",
+        "MPWR", "MRVL", "MU", "NVDA", "NXPI", "QCOM", "SNDK", "TER", "TXN",
+    ],
+}
+
+# ---------------------------------------------------------------------------
 # Liquidity filters
 # ---------------------------------------------------------------------------
 MIN_AVG_STOCK_VOLUME = 1_000_000   # 10-day average shares/day
@@ -51,6 +76,7 @@ OUTPUT_DIR = "reports"      # markdown files land here (relative to script)
 # ---------------------------------------------------------------------------
 # Scoring weights (must sum to 1). See README for the formula.
 # ---------------------------------------------------------------------------
-W_YIELD = 0.45     # annualized return on collateral
-W_SAFETY = 0.35    # probability of expiring OTM (1 - |delta|)
-W_CUSHION = 0.20   # % distance from spot to strike
+W_RICHNESS = 0.40  # IV percentile: today's implied vol vs the stock's past year
+W_YIELD = 0.20     # annualized return on collateral
+W_SAFETY = 0.30    # lower |delta| within the DELTA_MIN..DELTA_MAX band
+W_CUSHION = 0.10   # % distance from spot to strike
