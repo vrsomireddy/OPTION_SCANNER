@@ -44,6 +44,7 @@ MIN_BID = 0.20                     # ignore sub-20c options
 # Output
 # ---------------------------------------------------------------------------
 TOP_N = 5                   # suggestions per day
+ALTERNATIVE_N = 5           # additional qualifying names outside the top picks
 MAX_PER_TICKER = 1          # best contract per underlying
 OUTPUT_DIR = "reports"      # markdown files land here (relative to script)
 

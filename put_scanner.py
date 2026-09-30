@@ -23,7 +23,7 @@ import os
 import smtplib
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import date, datetime
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -70,6 +70,21 @@ class PutCandidate:
     score: float = 0.0
 
 
+class ScanDataError(Exception):
+    """Identify a stock whose required data could not be verified."""
+
+
+class ScanSkipped(Exception):
+    """Identify a stock excluded before its contracts were evaluated."""
+
+
+@dataclass
+class PreviousScan:
+    day: date
+    candidates: list[PutCandidate]
+    displayed: list[PutCandidate]
+
+
 # ---------------------------------------------------------------------------
 # Math
 # ---------------------------------------------------------------------------
@@ -107,9 +122,9 @@ def get_spot_and_volume(tk: yf.Ticker) -> tuple[float | None, float | None]:
         return None, None
 
 
-def get_next_earnings(tk: yf.Ticker) -> date | None:
-    """Find the company's next earnings announcement date, if known."""
-    today = date.today()
+def get_next_earnings(tk: yf.Ticker, today: date | None = None) -> date | None:
+    """Find the company's next known earnings announcement on or after the scan day."""
+    today = today if today is not None else date.today()
     try:
         df = tk.get_earnings_dates(limit=8)
         if df is not None and not df.empty:
@@ -124,7 +139,7 @@ def get_next_earnings(tk: yf.Ticker) -> date | None:
             ed = cal.get("Earnings Date")
             if ed:
                 ed = ed if isinstance(ed, list) else [ed]
-                dates = [d if isinstance(d, date) else pd.Timestamp(d).date() for d in ed]
+                dates = [pd.Timestamp(d).date() for d in ed]
                 dates = [d for d in dates if d >= today]
                 if dates:
                     return min(dates)
@@ -137,25 +152,31 @@ def get_next_earnings(tk: yf.Ticker) -> date | None:
 # Scan
 # ---------------------------------------------------------------------------
 def scan_ticker(symbol: str, today: date) -> list[PutCandidate]:
-    """Check one stock and return every put option worth considering for it."""
+    """Find qualifying puts for one stock or explain why it could not be evaluated."""
     tk = yf.Ticker(symbol)
     spot, avg_vol = get_spot_and_volume(tk)
-    if spot is None:
-        return []
+    if spot is None or not math.isfinite(spot) or spot <= 0:
+        raise ScanDataError("stock price unavailable")
     if C.MAX_STOCK_PRICE and spot > C.MAX_STOCK_PRICE:
         log.info("%s: skip, price %.2f > %.0f", symbol, spot, C.MAX_STOCK_PRICE)
-        return []
-    if avg_vol and avg_vol < C.MIN_AVG_STOCK_VOLUME:
+        raise ScanSkipped("stock price exceeds limit")
+    if C.MIN_AVG_STOCK_VOLUME > 0 and (avg_vol is None or not math.isfinite(avg_vol) or avg_vol <= 0):
+        raise ScanDataError("average stock volume unavailable")
+    if avg_vol is not None and avg_vol < C.MIN_AVG_STOCK_VOLUME:
         log.info("%s: skip, avg volume %.0f too low", symbol, avg_vol)
-        return []
+        raise ScanSkipped("average stock volume below limit")
 
-    earnings = get_next_earnings(tk) if C.SKIP_EARNINGS else None
+    earnings = get_next_earnings(tk, today) if C.SKIP_EARNINGS else None
+    if C.SKIP_EARNINGS and earnings is None:
+        raise ScanDataError("next earnings date unavailable")
 
     try:
         expirations = tk.options
     except Exception as e:
         log.warning("%s: no option chain (%s)", symbol, e)
-        return []
+        raise ScanDataError("option expirations unavailable") from e
+    if not expirations:
+        raise ScanSkipped("no listed option expirations")
 
     out: list[PutCandidate] = []
     for exp_str in expirations:
@@ -171,9 +192,9 @@ def scan_ticker(symbol: str, today: date) -> list[PutCandidate]:
             puts = tk.option_chain(exp_str).puts
         except Exception as e:
             log.warning("%s %s: chain fetch failed (%s)", symbol, exp_str, e)
-            continue
+            raise ScanDataError(f"option chain unavailable for {exp_str}") from e
         if puts is None or puts.empty:
-            continue
+            raise ScanDataError(f"put chain empty for {exp_str}")
 
         t_years = dte / 365.0
         for row in puts.itertuples(index=False):
@@ -258,17 +279,88 @@ def pick_top(cands: list[PutCandidate]) -> list[PutCandidate]:
     return picks
 
 
+def pick_alternatives(ranked: list[PutCandidate], picks: list[PutCandidate]) -> list[PutCandidate]:
+    """Choose additional qualifying stocks in score order without repeating a name."""
+    seen = {c.ticker for c in picks}
+    alternatives = []
+    for c in ranked:
+        if len(alternatives) >= C.ALTERNATIVE_N:
+            break
+        if c.ticker not in seen:
+            alternatives.append(c)
+            seen.add(c.ticker)
+    return alternatives
+
+
+def contract_key(c: PutCandidate) -> tuple[str, str, float]:
+    """Identify a put by its stock, expiration, and exact strike."""
+    return c.ticker, c.expiration, c.strike
+
+
+def load_previous_scan(out_dir: Path, today: date) -> PreviousScan | None:
+    """Read the latest usable earlier daily results for comparison."""
+    for path in sorted(out_dir.glob("all_candidates_*.csv"), reverse=True):
+        try:
+            day = date.fromisoformat(path.stem.removeprefix("all_candidates_"))
+            if day >= today:
+                continue
+            df = pd.read_csv(path)
+            names = [field.name for field in fields(PutCandidate)]
+            records = df[names].to_dict("records")
+            candidates = [PutCandidate(**row) for row in records]
+            for c in candidates:
+                if not all(math.isfinite(getattr(c, name)) for name in
+                           ("spot", "strike", "bid", "ask", "dte", "score", "annualized_return")):
+                    raise ValueError("invalid comparison values")
+            if "report_group" in df:
+                displayed = [c for c, group in zip(candidates, df["report_group"], strict=True)
+                             if group in ("top", "alternative")]
+            else:
+                displayed = pick_top(candidates)
+            return PreviousScan(day, candidates, displayed)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            log.warning("Skipping unreadable comparison history %s: %s", path.name, e)
+    return None
+
+
+def describe_change(c: PutCandidate, previous: PreviousScan | None) -> str:
+    """Explain what changed and flag unchanged prices without claiming they are stale."""
+    if previous is None:
+        return "No previous report available for comparison."
+    shown = [old for old in previous.displayed if old.ticker == c.ticker]
+    if not shown:
+        status = "New ticker in recommendations"
+    elif any(contract_key(old) == contract_key(c) for old in shown):
+        status = "Repeat contract"
+    else:
+        old = shown[0]
+        status = f"Changed contract (previously {old.expiration} {old.strike:g}P)"
+    old = next((old for old in previous.candidates if contract_key(old) == contract_key(c)), None)
+    if old is None:
+        return status + "; no prior quote for this exact contract, bid/score changes unavailable."
+    note = f"{status}; same-contract bid change {c.bid - old.bid:+.2f}, score change {c.score - old.score:+.4f}."
+    if (c.spot, c.bid, c.ask) == (old.spot, old.bid, old.ask):
+        note += " Potentially stale: spot, bid and ask unchanged; freshness unverified."
+        if c.dte < old.dte and c.annualized_return > old.annualized_return:
+            note += " Annualized return rose as DTE fell with the same bid; no better quoted premium."
+    return note
+
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
-def to_markdown(picks: list[PutCandidate], scanned: int, total_cands: int, run_ts: datetime) -> str:
-    """Turn the day's picks into a readable report."""
+def to_markdown(
+    picks: list[PutCandidate], scanned: int, total_cands: int, run_ts: datetime,
+    failures: dict[str, str] | None = None, skipped: dict[str, str] | None = None,
+    alternatives: list[PutCandidate] | None = None, previous: PreviousScan | None = None,
+) -> str:
+    """Present ranked picks, alternatives, daily changes, and data limitations."""
     lines = [
-        f"# Cash-Secured Put Suggestions — {run_ts.strftime('%Y-%m-%d %H:%M %Z')}",
+        f"# Cash-Secured Put Suggestions - {run_ts.strftime('%Y-%m-%d %H:%M %Z')}",
         "",
         f"Universe: {scanned} Nasdaq-100 names scanned · {total_cands} contracts passed filters · "
         f"top {len(picks)} shown. Data: Yahoo Finance (may be ~15 min delayed). "
-        "**Suggestions only — nothing is executed.**",
+        "**Suggestions only; nothing is executed.**",
         "",
         f"Filters: |Δ| {C.DELTA_MIN:.2f}–{C.DELTA_MAX:.2f} · DTE {C.DTE_MIN}–{C.DTE_MAX} · "
         f"≥{C.MIN_ANNUALIZED_RETURN:.0%} annualized · OI ≥ {C.MIN_OPEN_INTEREST} · "
@@ -276,8 +368,17 @@ def to_markdown(picks: list[PutCandidate], scanned: int, total_cands: int, run_t
         + (" · earnings skipped" if C.SKIP_EARNINGS else ""),
         "",
     ]
+    if skipped:
+        lines += [f"Stocks skipped before contract evaluation: {len(skipped)}.", ""]
+        lines += [f"- {symbol}: {reason}" for symbol, reason in skipped.items()]
+        lines.append("")
+    if failures:
+        lines += [f"**INCOMPLETE SCAN: required data failed for {len(failures)} stocks.**", ""]
+        lines += [f"- {symbol}: {reason}" for symbol, reason in failures.items()]
+        lines.append("")
     if not picks:
-        lines.append("_No contracts met the criteria today._")
+        lines.append("_No qualifying contracts in the available data; the scan is incomplete._" if failures
+                     else "_No contracts met the criteria today._")
         return "\n".join(lines)
 
     lines += [
@@ -294,37 +395,61 @@ def to_markdown(picks: list[PutCandidate], scanned: int, total_cands: int, run_t
     lines += ["", "### Trade descriptions", ""]
     for i, c in enumerate(picks, 1):
         lines.append(
-            f"{i}. **SELL TO OPEN 1 {c.ticker} {c.expiration} {c.strike:.0f}P @ {c.bid:.2f} (limit)** — "
+            f"{i}. **SELL TO OPEN 1 {c.ticker} {c.expiration} {str(c.strike).removesuffix('.0')}P @ {c.bid:.2f} (limit)**: "
             f"collect ~${c.premium_per_contract:,.0f} against ${c.collateral:,.0f} cash. "
             f"IV {c.iv:.0%}, OI {c.open_interest:,}, spread {c.spread_pct:.1%}. "
             f"Assigned below {c.strike:.2f}; breakeven {c.breakeven:.2f} "
             f"({c.cushion_pct:.1%} below spot)."
             + (f" Next earnings {c.earnings_date} (after expiry)." if c.earnings_date else "")
         )
+    lines += ["", "### Changes since the previous report", ""]
+    if previous:
+        lines += [f"Compared with {previous.day.isoformat()}. Bid and score changes compare the exact same contract.", ""]
+    lines += [f"- **{c.ticker} {c.expiration} {c.strike:g}P**: {describe_change(c, previous)}" for c in picks]
+    lines += ["", "### Alternative names", ""]
+    if alternatives:
+        lines += [
+            "Next qualifying names by score, excluding the top-pick tickers.", "",
+            "| Ticker | Expiration | Strike | Bid | Collateral | Ann. Ret | Score | Changes |",
+            "|--------|------------|--------|-----|------------|----------|-------|---------|",
+        ]
+        for c in alternatives:
+            lines.append(
+                f"| {c.ticker} | {c.expiration} | {c.strike:g} | {c.bid:.2f} | ${c.collateral:,.0f} | "
+                f"{c.annualized_return:.1%} | {c.score:.4f} | {describe_change(c, previous)} |"
+            )
+    else:
+        lines.append("No additional names selected.")
+    lines += ["", "Unchanged quotes are a freshness warning, not proof of stale data. Quote timestamps are unavailable."]
     lines += ["", "_Not financial advice. Verify quotes with your broker before trading._"]
     return "\n".join(lines)
 
 
-def to_sms(picks: list[PutCandidate], run_ts: datetime) -> str:
-    """Condense the day's picks into a short text-message-friendly summary."""
+def to_sms(
+    picks: list[PutCandidate], run_ts: datetime, previous: PreviousScan | None = None,
+    alternatives: list[PutCandidate] | None = None,
+) -> str:
+    """Summarize picks, changes, and alternative names for text delivery."""
     if not picks:
         return f"Put scan {run_ts:%m/%d}: no qualifying contracts."
     parts = [f"Put scan {run_ts:%m/%d}:"]
     for c in picks:
-        parts.append(f"{c.ticker} {c.expiration[5:]} {c.strike:.0f}P bid {c.bid:.2f} "
+        parts.append(f"{c.ticker} {c.expiration[5:]} {str(c.strike).removesuffix('.0')}P bid {c.bid:.2f} "
                      f"d{abs(c.delta):.2f} {c.annualized_return:.0%}ann")
+        parts.append(describe_change(c, previous))
+    if alternatives:
+        parts.append("Alternatives: " + ", ".join(c.ticker for c in alternatives) + ". See full report for quotes and changes.")
     return "\n".join(parts)
 
 
 def send_email(subject: str, body: str, to_addr: str, subtype: str = "plain") -> None:
-    """Send the report to someone's inbox by email."""
+    """Send the requested email or report why delivery could not be completed."""
     host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     port = int(os.getenv("SMTP_PORT", "587"))
     user = os.getenv("SMTP_USER")
     pw = os.getenv("SMTP_PASS")
     if not (user and pw):
-        log.warning("SMTP_USER/SMTP_PASS not set; skipping send to %s", to_addr)
-        return
+        raise ValueError("SMTP_USER/SMTP_PASS required for requested delivery")
     msg = MIMEText(body, subtype)
     msg["Subject"] = subject
     msg["From"] = user
@@ -340,7 +465,7 @@ def send_email(subject: str, body: str, to_addr: str, subtype: str = "plain") ->
 # Main
 # ---------------------------------------------------------------------------
 def main() -> int:
-    """Run the full daily scan: check every stock, rank the results, and deliver the report."""
+    """Deliver ranked picks and alternatives with historical comparisons and run status."""
     run_ts = datetime.now().astimezone()
     if "--test-email" in sys.argv:
         to_addr = os.getenv("EMAIL_TO")
@@ -361,6 +486,8 @@ def main() -> int:
     today = run_ts.date()
     all_cands: list[PutCandidate] = []
     scanned = 0
+    failures: dict[str, str] = {}
+    skipped: dict[str, str] = {}
 
     for sym in C.UNIVERSE:
         try:
@@ -368,36 +495,57 @@ def main() -> int:
             scanned += 1
             log.info("%s: %d candidates", sym, len(found))
             all_cands.extend(found)
+        except ScanSkipped as e:
+            skipped[sym] = str(e)
         except Exception as e:
-            log.error("%s: unexpected error: %s", sym, e)
+            failures[sym] = str(e)
+            log.error("%s: scan failed: %s", sym, e)
         time.sleep(0.3)  # be polite to Yahoo
 
     ranked = score(all_cands)
     picks = pick_top(ranked)
+    alternatives = pick_alternatives(ranked, picks)
+    out_dir = Path(__file__).resolve().parent / C.OUTPUT_DIR
+    previous = load_previous_scan(out_dir, today)
 
-    md = to_markdown(picks, scanned, len(ranked), run_ts)
+    md = to_markdown(picks, scanned, len(ranked), run_ts, failures, skipped, alternatives, previous)
     print(md)
 
-    out_dir = Path(__file__).resolve().parent / C.OUTPUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / f"puts_{run_ts:%Y-%m-%d}.md"
     out_file.write_text(md)
-    if ranked:
-        pd.DataFrame([asdict(c) for c in ranked]).to_csv(out_dir / f"all_candidates_{run_ts:%Y-%m-%d}.csv", index=False)
+    groups = {contract_key(c): "top" for c in picks}
+    groups.update({contract_key(c): "alternative" for c in alternatives})
+    rows = [dict(asdict(c), report_group=groups.get(contract_key(c), ""), comparison_date=previous.day if previous else "",
+                 change_note=describe_change(c, previous)) for c in ranked]
+    pd.DataFrame(rows, columns=[field.name for field in fields(PutCandidate)] +
+                 ["report_group", "comparison_date", "change_note"]).to_csv(
+        out_dir / f"all_candidates_{run_ts:%Y-%m-%d}.csv", index=False,
+    )
     log.info("wrote %s", out_file)
 
     subject = f"Put suggestions {run_ts:%Y-%m-%d}: " + (", ".join(c.ticker for c in picks) or "none")
+    if failures:
+        subject = "INCOMPLETE: " + subject
+    delivery_failed = False
     if os.getenv("EMAIL_TO"):
         try:
             send_email(subject, md, os.getenv("EMAIL_TO"))
         except Exception as e:
             log.error("email failed: %s", e)
+            delivery_failed = True
     if os.getenv("SMS_TO"):
         try:
-            send_email("", to_sms(picks, run_ts), os.getenv("SMS_TO"))
+            sms = to_sms(picks, run_ts, previous, alternatives)
+            if failures:
+                sms = f"INCOMPLETE SCAN: {len(failures)} stocks failed. " + (
+                    sms if picks else "No qualifying contracts in available data."
+                )
+            send_email("", sms, os.getenv("SMS_TO"))
         except Exception as e:
             log.error("sms failed: %s", e)
-    return 0
+            delivery_failed = True
+    return 1 if failures or delivery_failed else 0
 
 
 if __name__ == "__main__":

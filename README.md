@@ -9,10 +9,14 @@ Each run:
 2. Drops underlyings with thin volume (`MIN_AVG_STOCK_VOLUME`, 1M shares/day) or
    priced above `MAX_STOCK_PRICE` — that price cap is currently `None`, i.e. disabled.
 3. Looks at every expiration 21–45 DTE, skipping any that spans the next earnings date.
+   Stocks with unknown earnings dates or missing required average volume are excluded
+   and recorded as data failures.
 4. For each OTM put: computes Black-Scholes delta from the quoted implied vol,
    keeps |Δ| 0.15–0.25, OI ≥ 500, bid ≥ $0.20, bid-ask ≤ 10%, and **annualized return on
    collateral ≥ 15%** where `annualized = bid / strike × 365 / DTE`.
 5. Scores, ranks, keeps the best contract per ticker, and outputs the top 5.
+6. Adds up to 5 alternative names, in score order, excluding all top-pick tickers.
+7. Compares recommendations with the latest usable earlier daily report.
 
 ### Scoring (deterministic)
 
@@ -27,6 +31,39 @@ Weights live in `config.py`. Same inputs → same output, always.
 - Terminal + `reports/puts_YYYY-MM-DD.md` (top 5 table + trade descriptions)
 - `reports/all_candidates_YYYY-MM-DD.csv` (everything that passed filters, ranked)
 - Optional email and/or SMS (see below)
+
+Reports distinguish completed stocks, stocks skipped before contract evaluation,
+and data failures. Any data failure marks the report and notifications incomplete
+and returns exit status 1; requested notification failures also return 1. A failed
+chain excludes that stock from the run. Successful empty scans return 0.
+Same-day reruns replace both reports; empty results produce a CSV with headers only.
+
+### Daily changes and alternatives
+
+The full report labels each displayed put as a new ticker, a changed contract,
+or a repeat contract relative to the previous report's displayed names and contracts.
+It shows bid and score changes only when the exact ticker, expiration, and strike
+exist in the previous candidate CSV. A changed contract can still have a comparison
+if it was previously among the qualifying candidates. Missing comparisons are explicit.
+These labels describe report membership, not positions you hold or trades you made.
+
+The comparison date is shown explicitly. Same-day and future files are ignored;
+unreadable files are logged and the next earlier usable file is tried. An empty
+prior CSV is a valid baseline. Older CSVs without selection metadata use the current
+top-pick limits to reconstruct their selections, so changed limits can affect those
+legacy labels. New CSVs record the actual `report_group`, `comparison_date`, and
+`change_note`. Prior reports may be incomplete, and score changes can also reflect
+configuration changes.
+
+Identical spot, bid, and ask values for the same contract trigger a **potentially
+stale** flag. When annualized return rises with a lower DTE and the same quote,
+the report explains that the quoted premium has not improved. This is a heuristic:
+unchanged prices do not prove staleness, changed prices do not prove freshness,
+and quote timestamps are unavailable. Flags do not change ranking or eligibility.
+
+Email includes the full comparisons and alternatives. Text messages include changes
+for top picks and the alternative names; details for alternatives are in the full
+report. The longer text may span multiple messages depending on delivery service.
 
 `reports/`, `logs/`, `venv/`, and `.env` are gitignored.
 
@@ -59,7 +96,7 @@ bash -c 'set -a && source .env && set +a && ./venv/bin/python put_scanner.py --t
 ```
 
 It sends a one-line test message and exits. On a bad login it prints the Gmail error
-and returns 1 instead of a traceback.
+and returns 1 instead of a traceback. Missing SMTP credentials also return 1.
 
 ## Scheduling on Mac
 
@@ -78,7 +115,7 @@ Give cron Full Disk Access if macOS blocks it: System Settings → Privacy & Sec
 The bundled `com.venkat.putscanner.plist` still has `YOUR_USER` placeholders and is not
 installed. To switch to it, remove the cron line first so the scan does not run twice:
 ```bash
-crontab -r
+crontab -e   # remove only the scanner entry; preserve other jobs
 sed -i '' "s#/Users/YOUR_USER/put-scanner#$HOME/projects/option_scanner#g" com.venkat.putscanner.plist
 cp com.venkat.putscanner.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.venkat.putscanner.plist
@@ -101,6 +138,8 @@ All knobs are in `config.py`. Common tweaks:
 - Lower `MIN_ANNUALIZED_RETURN` in low-IV markets or you may get an empty list.
 - Raise `MAX_SPREAD_PCT` above 0.10 if wide-market names are being filtered out.
 - `MAX_PER_TICKER = 2` to see two expirations per name.
+- `ALTERNATIVE_N = 5` adds five distinct names after the top picks; set it to `0`
+  to disable alternatives. Fewer are shown when too few additional names qualify.
 
 ## Caveats
 - Yahoo data is ~15 min delayed and occasionally stale/missing; treat bids as approximate and confirm on IBKR before entering an order.

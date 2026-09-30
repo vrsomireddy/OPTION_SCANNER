@@ -1,6 +1,7 @@
 """Unit tests for put_scanner.py. All network calls (yfinance, SMTP) are mocked."""
 import math
 import smtplib
+from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
 
 import pandas as pd
@@ -250,30 +251,38 @@ def _install_ticker(monkeypatch, fake_tk):
     monkeypatch.setattr(ps.yf, "Ticker", lambda symbol: fake_tk)
 
 
-def test_scan_ticker_no_spot_returns_empty(monkeypatch, loose_config):
+def test_scan_ticker_no_spot_reports_failure(monkeypatch, loose_config):
+    """Check that unavailable data and excluded stocks have distinct outcomes."""
     tk = FakeTicker(fast_info_raises=True, history_raises=True)
     _install_ticker(monkeypatch, tk)
-    assert ps.scan_ticker("AAA", date.today()) == []
+    with pytest.raises(ps.ScanDataError, match="stock price unavailable"):
+        ps.scan_ticker("AAA", date.today())
 
 
 def test_scan_ticker_price_too_high_skips(monkeypatch, loose_config):
+    """Check that unavailable data and excluded stocks have distinct outcomes."""
     monkeypatch.setattr(C, "MAX_STOCK_PRICE", 50)
     tk = FakeTicker(fast_info={"last_price": 100.0, "ten_day_average_volume": 5_000_000})
     _install_ticker(monkeypatch, tk)
-    assert ps.scan_ticker("AAA", date.today()) == []
+    with pytest.raises(ps.ScanSkipped, match="stock price exceeds limit"):
+        ps.scan_ticker("AAA", date.today())
 
 
 def test_scan_ticker_low_volume_skips(monkeypatch, loose_config):
+    """Check that unavailable data and excluded stocks have distinct outcomes."""
     monkeypatch.setattr(C, "MIN_AVG_STOCK_VOLUME", 1_000_000)
     tk = FakeTicker(fast_info={"last_price": 100.0, "ten_day_average_volume": 500})
     _install_ticker(monkeypatch, tk)
-    assert ps.scan_ticker("AAA", date.today()) == []
+    with pytest.raises(ps.ScanSkipped, match="average stock volume below limit"):
+        ps.scan_ticker("AAA", date.today())
 
 
-def test_scan_ticker_no_option_chain_skips(monkeypatch, loose_config):
+def test_scan_ticker_no_option_chain_reports_failure(monkeypatch, loose_config):
+    """Check that unavailable data and excluded stocks have distinct outcomes."""
     tk = FakeTicker(fast_info={"last_price": 100.0, "ten_day_average_volume": 5_000_000}, options_raises=True)
     _install_ticker(monkeypatch, tk)
-    assert ps.scan_ticker("AAA", date.today()) == []
+    with pytest.raises(ps.ScanDataError, match="option expirations unavailable"):
+        ps.scan_ticker("AAA", date.today())
 
 
 def test_scan_ticker_dte_out_of_window_skips(monkeypatch, loose_config):
@@ -305,7 +314,8 @@ def test_scan_ticker_earnings_within_window_skips_that_expiration(monkeypatch, l
     assert ps.scan_ticker("AAA", today) == []
 
 
-def test_scan_ticker_chain_fetch_failure_is_skipped(monkeypatch, loose_config):
+def test_scan_ticker_chain_fetch_failure_is_reported(monkeypatch, loose_config):
+    """Check that unavailable data and excluded stocks have distinct outcomes."""
     today = date.today()
     exp_str = (today + timedelta(days=30)).isoformat()
 
@@ -315,10 +325,12 @@ def test_scan_ticker_chain_fetch_failure_is_skipped(monkeypatch, loose_config):
 
     tk = RaisingChainTicker(fast_info={"last_price": 100.0, "ten_day_average_volume": 5_000_000}, options=(exp_str,))
     _install_ticker(monkeypatch, tk)
-    assert ps.scan_ticker("AAA", today) == []
+    with pytest.raises(ps.ScanDataError, match="option chain unavailable"):
+        ps.scan_ticker("AAA", today)
 
 
-def test_scan_ticker_empty_puts_is_skipped(monkeypatch, loose_config):
+def test_scan_ticker_empty_puts_reports_failure(monkeypatch, loose_config):
+    """Check that unavailable data and excluded stocks have distinct outcomes."""
     today = date.today()
     exp_str = (today + timedelta(days=30)).isoformat()
     tk = FakeTicker(
@@ -327,7 +339,8 @@ def test_scan_ticker_empty_puts_is_skipped(monkeypatch, loose_config):
         option_chains={exp_str: Chain(pd.DataFrame())},
     )
     _install_ticker(monkeypatch, tk)
-    assert ps.scan_ticker("AAA", today) == []
+    with pytest.raises(ps.ScanDataError, match="put chain empty"):
+        ps.scan_ticker("AAA", today)
 
 
 def _scan_with_row(monkeypatch, row, today=None):
@@ -462,6 +475,7 @@ def test_to_sms_with_picks():
 # send_email
 # ---------------------------------------------------------------------------
 def test_send_email_missing_credentials_skips_send(monkeypatch):
+    """Reject requested delivery when credentials are missing."""
     monkeypatch.delenv("SMTP_USER", raising=False)
     monkeypatch.delenv("SMTP_PASS", raising=False)
     called = {"smtp": False}
@@ -471,7 +485,8 @@ def test_send_email_missing_credentials_skips_send(monkeypatch):
             called["smtp"] = True
 
     monkeypatch.setattr(smtplib, "SMTP", BoomSMTP)
-    ps.send_email("subj", "body", "to@example.com")
+    with pytest.raises(ValueError, match="SMTP_USER/SMTP_PASS"):
+        ps.send_email("subj", "body", "to@example.com")
     assert called["smtp"] is False
 
 
@@ -557,6 +572,7 @@ def test_main_test_email_generic_error(monkeypatch, main_env):
 
 
 def test_main_full_run_writes_reports_and_sends_notifications(monkeypatch, main_env, capsys):
+    """Keep available picks and label partial failures in every delivery."""
     monkeypatch.setattr(ps.sys, "argv", ["put_scanner.py"])
     monkeypatch.setenv("EMAIL_TO", "to@example.com")
     monkeypatch.setenv("SMS_TO", "+15551234567")
@@ -570,9 +586,12 @@ def test_main_full_run_writes_reports_and_sends_notifications(monkeypatch, main_
     monkeypatch.setattr(ps, "scan_ticker", fake_scan)
     monkeypatch.setattr(ps, "send_email", lambda *a, **k: sent.append(a))
 
-    assert ps.main() == 0
+    assert ps.main() == 1
     out = capsys.readouterr().out
     assert "AAA" in out
+    assert "INCOMPLETE SCAN" in out
+    assert sent[0][0].startswith("INCOMPLETE:")
+    assert "INCOMPLETE SCAN" in sent[1][1]
 
     md_files = list(main_env.glob("puts_*.md"))
     csv_files = list(main_env.glob("all_candidates_*.csv"))
@@ -581,16 +600,18 @@ def test_main_full_run_writes_reports_and_sends_notifications(monkeypatch, main_
     assert len(sent) == 2  # one email, one "sms" (sent via send_email too)
 
 
-def test_main_full_run_no_candidates_skips_csv(monkeypatch, main_env):
+def test_main_full_run_no_candidates_writes_empty_csv(monkeypatch, main_env):
+    """Write an empty candidate table when no contracts qualify."""
     monkeypatch.setattr(ps.sys, "argv", ["put_scanner.py"])
     monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today: [])
 
     assert ps.main() == 0
-    assert list(main_env.glob("all_candidates_*.csv")) == []
+    assert pd.read_csv(next(main_env.glob("all_candidates_*.csv"))).empty
     assert len(list(main_env.glob("puts_*.md"))) == 1
 
 
-def test_main_notification_failures_are_swallowed(monkeypatch, main_env):
+def test_main_notification_failures_return_error(monkeypatch, main_env):
+    """Report failed notifications through the exit status."""
     monkeypatch.setattr(ps.sys, "argv", ["put_scanner.py"])
     monkeypatch.setenv("EMAIL_TO", "to@example.com")
     monkeypatch.setenv("SMS_TO", "+15551234567")
@@ -600,4 +621,210 @@ def test_main_notification_failures_are_swallowed(monkeypatch, main_env):
         raise RuntimeError("network down")
 
     monkeypatch.setattr(ps, "send_email", boom)
-    assert ps.main() == 0  # errors are logged, not raised
+    assert ps.main() == 1
+
+
+@pytest.mark.parametrize("volume", [None, 0, float("nan"), float("inf")])
+def test_scan_rejects_unknown_required_volume(monkeypatch, loose_config, volume):
+    """Exclude stocks whose required trading volume cannot be verified."""
+    monkeypatch.setattr(C, "MIN_AVG_STOCK_VOLUME", 1_000_000)
+    monkeypatch.setattr(ps, "get_spot_and_volume", lambda tk: (100, volume))
+    _install_ticker(monkeypatch, FakeTicker())
+    with pytest.raises(ps.ScanDataError, match="volume unavailable"):
+        ps.scan_ticker("AAA", date.today())
+
+
+def test_scan_rejects_unknown_earnings(monkeypatch, loose_config):
+    """Exclude stocks when the enabled earnings check cannot be completed."""
+    monkeypatch.setattr(C, "SKIP_EARNINGS", True)
+    tk = FakeTicker(fast_info={"last_price": 100, "ten_day_average_volume": 2_000_000})
+    _install_ticker(monkeypatch, tk)
+    with pytest.raises(ps.ScanDataError, match="earnings date unavailable"):
+        ps.scan_ticker("AAA", date.today())
+
+
+@pytest.mark.parametrize("value", [datetime(2020, 1, 5), pd.Timestamp("2020-01-05", tz="UTC")])
+def test_earnings_normalizes_datetime_and_uses_scan_date(value):
+    """Recognize calendar timestamps relative to the requested scan day."""
+    tk = FakeTicker(calendar={"Earnings Date": [value]})
+    assert ps.get_next_earnings(tk, date(2020, 1, 1)) == date(2020, 1, 5)
+
+
+@pytest.mark.parametrize("strike", [92.5, 92.25, 92.125])
+def test_reports_preserve_fractional_strikes(strike):
+    """Keep the exact fractional strike in trade descriptions and texts."""
+    candidate = make_candidate(strike=strike)
+    run_ts = datetime(2026, 9, 13)
+    assert f"{strike}P" in ps.to_markdown([candidate], 1, 1, run_ts)
+    assert f"{strike}P" in ps.to_sms([candidate], run_ts)
+
+
+def test_email_check_missing_credentials_fails(monkeypatch, main_env):
+    """Fail email verification without attempting delivery when credentials are missing."""
+    monkeypatch.setattr(ps.sys, "argv", ["put_scanner.py", "--test-email"])
+    monkeypatch.setenv("EMAIL_TO", "to@example.com")
+    monkeypatch.delenv("SMTP_USER", raising=False)
+    monkeypatch.delenv("SMTP_PASS", raising=False)
+    assert ps.main() == 1
+
+
+def test_empty_rerun_replaces_previous_csv(monkeypatch, main_env):
+    """Remove old candidates from the daily table when a rerun finds none."""
+    monkeypatch.setattr(ps.sys, "argv", ["put_scanner.py"])
+    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today: [make_candidate(ticker=symbol)])
+    assert ps.main() == 0
+    csv = next(main_env.glob("all_candidates_*.csv"))
+    assert len(pd.read_csv(csv)) == 2
+    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today: [])
+    assert ps.main() == 0
+    assert pd.read_csv(csv).empty
+    assert "No contracts met" in next(main_env.glob("puts_*.md")).read_text()
+
+
+def test_total_outage_is_not_a_successful_empty_scan(monkeypatch, main_env, capsys):
+    """Label a total data outage as incomplete in reports and texts."""
+    monkeypatch.setattr(ps.sys, "argv", ["put_scanner.py"])
+    monkeypatch.setenv("SMS_TO", "to@example.com")
+    sent = []
+    monkeypatch.setattr(ps, "send_email", lambda *args: sent.append(args))
+
+    def fail(symbol, today):
+        """Represent a stock whose data could not be fetched."""
+        raise ps.ScanDataError("stock price unavailable")
+
+    monkeypatch.setattr(ps, "scan_ticker", fail)
+    assert ps.main() == 1
+    report = capsys.readouterr().out
+    assert "0 Nasdaq-100 names scanned" in report
+    assert "INCOMPLETE SCAN" in report
+    assert "No contracts met the criteria today" not in report
+    assert "INCOMPLETE SCAN" in sent[0][1]
+
+
+def test_skipped_stocks_are_reported_separately(monkeypatch, main_env, capsys):
+    """Distinguish intentional exclusions from completed scans and data failures."""
+    monkeypatch.setattr(ps.sys, "argv", ["put_scanner.py"])
+
+    def skip(symbol, today):
+        """Represent a stock excluded by the price limit."""
+        raise ps.ScanSkipped("stock price exceeds limit")
+
+    monkeypatch.setattr(ps, "scan_ticker", skip)
+    assert ps.main() == 0
+    report = capsys.readouterr().out
+    assert "Stocks skipped before contract evaluation: 2" in report
+    assert "INCOMPLETE" not in report
+
+
+def test_no_listed_expirations_is_a_skip(monkeypatch, loose_config):
+    """Treat stocks with no listed options as intentional exclusions."""
+    _install_ticker(monkeypatch, FakeTicker(fast_info={"last_price": 100}))
+    with pytest.raises(ps.ScanSkipped, match="no listed option expirations"):
+        ps.scan_ticker("AAA", date.today())
+
+
+def test_alternatives_keep_rank_order_and_exclude_all_top_names(monkeypatch):
+    """Select distinct alternative names without changing the original ranking."""
+    monkeypatch.setattr(C, "ALTERNATIVE_N", 2)
+    ranked = [make_candidate(ticker=name) for name in ["AAA", "AAA", "BBB", "BBB", "CCC", "DDD"]]
+    assert [c.ticker for c in ps.pick_alternatives(ranked, ranked[:1])] == ["BBB", "CCC"]
+    monkeypatch.setattr(C, "ALTERNATIVE_N", 0)
+    assert ps.pick_alternatives(ranked, ranked[:1]) == []
+    monkeypatch.setattr(C, "ALTERNATIVE_N", 5)
+    assert [c.ticker for c in ps.pick_alternatives(ranked, ranked[:1])] == ["BBB", "CCC", "DDD"]
+
+
+def test_change_labels_and_same_contract_comparison():
+    """Distinguish new names and changed contracts without comparing unrelated premiums."""
+    old = make_candidate(bid=1, score=0.6)
+    other_contract = make_candidate(strike=85, bid=0.5, score=0.4)
+    history = ps.PreviousScan(date(2026, 9, 10), [old, other_contract], [old])
+    repeated = ps.describe_change(make_candidate(bid=1.2, score=0.7), history)
+    assert "Repeat contract" in repeated
+    assert "bid change +0.20, score change +0.1000" in repeated
+    assert "Potentially stale" not in repeated
+    changed = ps.describe_change(make_candidate(strike=85, bid=0.7, score=0.5), history)
+    assert "Changed contract" in changed
+    assert "bid change +0.20" in changed
+    unavailable = ps.describe_change(make_candidate(strike=86), history)
+    assert "changes unavailable" in unavailable
+    assert "New ticker" in ps.describe_change(make_candidate(ticker="BBB"), history)
+    assert "No previous report" in ps.describe_change(old, None)
+
+
+def test_unchanged_quote_warns_about_dte_only_return_increase():
+    """Explain a rising annualized return when the same quote is reused the next day."""
+    old = make_candidate(dte=30, annualized_return=0.20)
+    history = ps.PreviousScan(date(2026, 9, 10), [old], [old])
+    note = ps.describe_change(make_candidate(dte=29, annualized_return=0.207), history)
+    assert "Potentially stale" in note
+    assert "no better quoted premium" in note
+    assert "return rose" not in ps.describe_change(old, history)
+    assert "Potentially stale" not in ps.describe_change(make_candidate(ask=1.2), history)
+
+
+def test_load_previous_scan_uses_recorded_selections_and_ignores_today(tmp_path):
+    """Use actual earlier selections even when today's output limits differ."""
+    rows = [dict(asdict(make_candidate(ticker=name)), report_group=group)
+            for name, group in [("AAA", ""), ("BBB", "top"), ("CCC", "alternative")]]
+    pd.DataFrame(rows).to_csv(tmp_path / "all_candidates_2026-09-10.csv", index=False)
+    (tmp_path / "all_candidates_2026-09-11.csv").write_text("ignored same-day file")
+    (tmp_path / "all_candidates_2026-09-12.csv").write_text("ignored future file")
+    previous = ps.load_previous_scan(tmp_path, date(2026, 9, 11))
+    assert previous.day == date(2026, 9, 10)
+    assert [c.ticker for c in previous.displayed] == ["BBB", "CCC"]
+    assert len(previous.candidates) == 3
+
+
+def test_load_previous_scan_supports_legacy_files_and_skips_corrupt_history(tmp_path, monkeypatch):
+    """Recover older results when a newer history file cannot be used."""
+    monkeypatch.setattr(C, "TOP_N", 1)
+    rows = [asdict(make_candidate(ticker=name)) for name in ["AAA", "BBB"]]
+    pd.DataFrame(rows).to_csv(tmp_path / "all_candidates_2026-09-08.csv", index=False)
+    (tmp_path / "all_candidates_2026-09-09.csv").write_text("invalid\nvalue\n")
+    pd.DataFrame([asdict(make_candidate(bid=float("nan")))]).to_csv(
+        tmp_path / "all_candidates_2026-09-10.csv", index=False,
+    )
+    previous = ps.load_previous_scan(tmp_path, date(2026, 9, 11))
+    assert previous.day == date(2026, 9, 8)
+    assert [c.ticker for c in previous.displayed] == ["AAA"]
+
+
+def test_empty_previous_scan_is_a_valid_baseline(tmp_path):
+    """Keep an empty prior day instead of falling back to older recommendations."""
+    pd.DataFrame(columns=list(asdict(make_candidate()))).to_csv(
+        tmp_path / "all_candidates_2026-09-10.csv", index=False,
+    )
+    previous = ps.load_previous_scan(tmp_path, date(2026, 9, 11))
+    assert previous.candidates == []
+    assert "New ticker" in ps.describe_change(make_candidate(), previous)
+
+
+def test_main_reports_alternatives_changes_and_persists_selections(monkeypatch, main_env, capsys):
+    """Carry prior-day comparisons through reports, notifications, and saved results."""
+    monkeypatch.setattr(ps.sys, "argv", ["put_scanner.py"])
+    monkeypatch.setattr(C, "TOP_N", 1)
+    monkeypatch.setattr(C, "ALTERNATIVE_N", 1)
+    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today: [make_candidate(ticker=symbol, dte=29)])
+    previous_day = date.today() - timedelta(days=1)
+    pd.DataFrame([asdict(make_candidate(ticker="AAA", dte=30))]).to_csv(
+        main_env / f"all_candidates_{previous_day}.csv", index=False,
+    )
+    monkeypatch.setenv("EMAIL_TO", "to@example.com")
+    monkeypatch.setenv("SMS_TO", "sms@example.com")
+    sent = []
+    monkeypatch.setattr(ps, "send_email", lambda *args: sent.append(args))
+    assert ps.main() == 0
+    report = capsys.readouterr().out
+    assert f"Compared with {previous_day}" in report
+    assert "Repeat contract" in report
+    assert "Potentially stale" in report
+    assert "Alternative names" in report
+    assert "New ticker in recommendations" in report
+    assert "Potentially stale" in sent[0][1]
+    assert "Potentially stale" in sent[1][1]
+    assert "Alternatives: BBB" in sent[1][1]
+    saved = pd.read_csv(main_env / f"all_candidates_{date.today()}.csv")
+    assert saved.report_group.tolist() == ["top", "alternative"]
+    assert saved.comparison_date.tolist() == [str(previous_day)] * 2
+    assert "Repeat contract" in saved.change_note.iloc[0]
