@@ -33,12 +33,16 @@ SKIP_EARNINGS = True        # drop expirations that span an earnings date
 RISK_FREE_RATE = 0.04       # used in Black-Scholes delta
 
 # ---------------------------------------------------------------------------
-# Premium richness: implied vol compared with the stock's own realized vol.
-# Yahoo has no IV history, so IV / 1-year realized vol stands in for IV rank.
+# Premium richness: where today's implied vol sits in the stock's past year.
+# Read from IBKR (IB Gateway or TWS must be running with the API enabled).
+# Gateway live port 4001, paper 4002; TWS live 7496, paper 7497.
 # ---------------------------------------------------------------------------
-HV_LOOKBACK = "1y"          # price history used for realized volatility
-HV_MIN_DAYS = 120           # fewer daily returns than this = data failure
-IV_HV_FULL_CREDIT = 1.5     # IV/HV at or above this earns the full richness score; 1.0 or below earns none
+IBKR_HOST = "127.0.0.1"
+IBKR_PORT = 4001
+IBKR_CLIENT_ID = 17         # any id not used by another API client
+IBKR_TIMEOUT = 10           # seconds to wait for the connection
+IV_LOOKBACK = "1 Y"         # implied-volatility history window
+IV_MIN_DAYS = 120           # fewer daily IV values than this = stock skipped
 
 # ---------------------------------------------------------------------------
 # Portfolio limits
@@ -72,7 +76,7 @@ OUTPUT_DIR = "reports"      # markdown files land here (relative to script)
 # ---------------------------------------------------------------------------
 # Scoring weights (must sum to 1). See README for the formula.
 # ---------------------------------------------------------------------------
-W_RICHNESS = 0.40  # implied vol relative to the stock's realized vol
+W_RICHNESS = 0.40  # IV percentile: today's implied vol vs the stock's past year
 W_YIELD = 0.20     # annualized return on collateral
 W_SAFETY = 0.30    # lower |delta| within the DELTA_MIN..DELTA_MAX band
 W_CUSHION = 0.10   # % distance from spot to strike

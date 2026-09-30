@@ -2,7 +2,8 @@
 """
 Daily cash-secured put scanner for Nasdaq-100 tech names.
 
-Suggestions only. This script never connects to a broker and never places orders.
+Suggestions only. This script never places orders. It reads implied-volatility
+history from Interactive Brokers over a read-only API connection.
 
 Pipeline
   1. Pull fresh quotes + option chains from Yahoo Finance (yfinance).
@@ -11,7 +12,9 @@ Pipeline
      pull the put chain and compute Black-Scholes delta from implied vol.
   4. Keep puts in the delta band with acceptable spread/OI and a bid that
      clears the annualized-return hurdle on cash collateral.
-  5. Score, rank, keep the best contract per ticker, print top N,
+  5. For stocks with candidates, look up where today's implied vol sits in
+     its past year (IBKR IV percentile).
+  6. Score, rank, keep the best contract per ticker, print top N,
      write a markdown report, and optionally email/SMS it.
 """
 
@@ -30,6 +33,7 @@ from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
+from ib_async import IB, StartupFetch, Stock
 from scipy.stats import norm
 
 import config as C
@@ -68,8 +72,7 @@ class PutCandidate:
     prob_otm: float             # 1 - |delta|
     earnings_date: str | None
     score: float = 0.0
-    hv: float = float("nan")            # stock's realized volatility over HV_LOOKBACK
-    iv_hv_ratio: float = float("nan")   # iv / hv; above 1 means options price in more movement than usual
+    iv_percentile: float = float("nan")  # share of past-year days with lower stock IV (IBKR); high = rich premium
 
 
 class ScanDataError(Exception):
@@ -124,23 +127,6 @@ def get_spot_and_volume(tk: yf.Ticker) -> tuple[float | None, float | None]:
         return None, None
 
 
-def get_realized_vol(tk: yf.Ticker) -> float | None:
-    """Measure how much the stock has actually moved over the past year, skipping recently listed stocks."""
-    try:
-        hist = tk.history(period=C.HV_LOOKBACK, auto_adjust=True)
-        closes = hist["Close"].dropna()
-        returns = (closes / closes.shift(1)).apply(math.log).dropna()
-    except Exception as e:
-        log.warning("%s: could not get price history (%s)", tk.ticker, e)
-        return None
-    if returns.empty:
-        return None
-    if len(returns) < C.HV_MIN_DAYS:
-        raise ScanSkipped("too little price history for realized volatility")
-    hv = float(returns.std() * math.sqrt(252))
-    return hv if math.isfinite(hv) and hv > 0 else None
-
-
 def get_next_earnings(tk: yf.Ticker, today: date | None = None) -> date | None:
     """Find the company's next known earnings announcement on or after the scan day."""
     today = today if today is not None else date.today()
@@ -165,6 +151,55 @@ def get_next_earnings(tk: yf.Ticker, today: date | None = None) -> date | None:
     except Exception:
         pass
     return None
+
+
+# ---------------------------------------------------------------------------
+# IBKR implied-volatility history (read-only; no order code in this project)
+# ---------------------------------------------------------------------------
+def connect_ibkr() -> IB | None:
+    """Open a read-only market data connection to a running IB Gateway or TWS, if one is available."""
+    ib = IB()
+    try:
+        ib.connect(C.IBKR_HOST, C.IBKR_PORT, clientId=C.IBKR_CLIENT_ID, timeout=C.IBKR_TIMEOUT,
+                   readonly=True, fetchFields=StartupFetch(0))
+    except Exception as e:
+        log.error("IBKR connection to %s:%s failed (%s); is IB Gateway/TWS running with the API enabled?",
+                  C.IBKR_HOST, C.IBKR_PORT, e)
+        return None
+    return ib
+
+
+def get_iv_percentile(ib: IB, symbol: str) -> float | None:
+    """Tell how today's implied volatility compares with the stock's past year, from 0 (lowest) to 1 (highest)."""
+    try:
+        contract = Stock(symbol, "SMART", "USD")
+        if not ib.qualifyContracts(contract):
+            return None
+        bars = ib.reqHistoricalData(contract, endDateTime="", durationStr=C.IV_LOOKBACK, barSizeSetting="1 day",
+                                    whatToShow="OPTION_IMPLIED_VOLATILITY", useRTH=True)
+        ivs = [b.close for b in bars or [] if b.close is not None and math.isfinite(b.close) and b.close > 0]
+    except Exception as e:
+        log.warning("%s: IBKR IV history failed (%s)", symbol, e)
+        return None
+    if not ivs:
+        return None
+    if len(ivs) < C.IV_MIN_DAYS:
+        raise ScanSkipped("too little implied volatility history")
+    today_iv, past = ivs[-1], ivs[:-1]
+    return sum(v < today_iv for v in past) / len(past)
+
+
+def add_iv_percentile(ib: IB | None, symbol: str, found: list[PutCandidate]) -> None:
+    """Attach the stock's IV percentile to its candidates or explain why it could not be found."""
+    if not found:
+        return
+    if ib is None:
+        raise ScanDataError("IV history unavailable: IBKR not connected")
+    pct = get_iv_percentile(ib, symbol)
+    if pct is None:
+        raise ScanDataError("IV history unavailable from IBKR")
+    for c in found:
+        c.iv_percentile = round(pct, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -198,10 +233,6 @@ def scan_ticker(symbol: str, today: date) -> list[PutCandidate]:
         raise ScanDataError("option expirations unavailable") from e
     if not expirations:
         raise ScanSkipped("no listed option expirations")
-
-    hv = get_realized_vol(tk)
-    if hv is None:
-        raise ScanDataError("realized volatility unavailable")
 
     out: list[PutCandidate] = []
     for exp_str in expirations:
@@ -276,8 +307,6 @@ def scan_ticker(symbol: str, today: date) -> list[PutCandidate]:
                     breakeven=round(strike - bid, 2),
                     prob_otm=round(1 - adelta, 3),
                     earnings_date=earnings.isoformat() if earnings else None,
-                    hv=round(hv, 4),
-                    iv_hv_ratio=round(iv / hv, 3),
                 )
             )
     return out
@@ -287,8 +316,7 @@ def score(cands: list[PutCandidate]) -> list[PutCandidate]:
     """Rate and rank each candidate by how attractive a trade it is, best first."""
     band = C.DELTA_MAX - C.DELTA_MIN
     for c in cands:
-        ratio = c.iv_hv_ratio if math.isfinite(c.iv_hv_ratio) else 1.0   # unknown earns no richness credit
-        rich = min(max((ratio - 1.0) / (C.IV_HV_FULL_CREDIT - 1.0), 0.0), 1.0)
+        rich = c.iv_percentile if math.isfinite(c.iv_percentile) else 0.0   # unknown earns no richness credit
         y = min(c.annualized_return, 0.60) / 0.60
         s = min(max((C.DELTA_MAX - abs(c.delta)) / band, 0.0), 1.0) if band > 0 else 1.0
         cu = min(c.cushion_pct, 0.20) / 0.20
@@ -344,7 +372,7 @@ def contract_key(c: PutCandidate) -> tuple[str, str, float]:
     return c.ticker, c.expiration, c.strike
 
 
-OPTIONAL_FIELDS = {"hv", "iv_hv_ratio"}   # absent from reports written before these were recorded
+OPTIONAL_FIELDS = {"iv_percentile"}   # absent from reports written before these were recorded
 
 
 def load_previous_scan(out_dir: Path, today: date) -> PreviousScan | None:
@@ -434,7 +462,7 @@ def to_markdown(
         return "\n".join(lines)
 
     lines += [
-        "| # | Ticker | Spot | Exp | DTE | Strike | Bid | Δ | P(OTM) | Cushion | IV/HV "
+        "| # | Ticker | Spot | Exp | DTE | Strike | Bid | Δ | P(OTM) | Cushion | IV pct "
         "| Ann. Ret | Premium/ct | Collateral | Breakeven | Score |",
         "|---|--------|------|-----|-----|--------|-----|---|--------|---------|-------"
         "|----------|------------|------------|-----------|-------|",
@@ -442,7 +470,7 @@ def to_markdown(
     for i, c in enumerate(picks, 1):
         lines.append(
             f"| {i} | **{c.ticker}** | {c.spot:.2f} | {c.expiration} | {c.dte} | {c.strike:.2f} | "
-            f"{c.bid:.2f} | {c.delta:.2f} | {c.prob_otm:.0%} | {c.cushion_pct:.1%} | {c.iv_hv_ratio:.2f} | "
+            f"{c.bid:.2f} | {c.delta:.2f} | {c.prob_otm:.0%} | {c.cushion_pct:.1%} | {c.iv_percentile:.0%} | "
             f"{c.annualized_return:.1%} | ${c.premium_per_contract:,.0f} | ${c.collateral:,.0f} | "
             f"{c.breakeven:.2f} | {c.score:.3f} |"
         )
@@ -451,7 +479,7 @@ def to_markdown(
         lines.append(
             f"{i}. **SELL TO OPEN 1 {c.ticker} {c.expiration} {str(c.strike).removesuffix('.0')}P @ {c.bid:.2f} (limit)**: "
             f"collect ~${c.premium_per_contract:,.0f} against ${c.collateral:,.0f} cash. "
-            f"IV {c.iv:.0%} vs {c.hv:.0%} realized ({c.iv_hv_ratio:.2f}x), OI {c.open_interest:,}, spread {c.spread_pct:.1%}. "
+            f"IV {c.iv:.0%}, higher than on {c.iv_percentile:.0%} of past-year days, OI {c.open_interest:,}, spread {c.spread_pct:.1%}. "
             f"Assigned below {c.strike:.2f}; breakeven {c.breakeven:.2f} "
             f"({c.cushion_pct:.1%} below spot)."
             + (f" Next earnings {c.earnings_date} (after expiry)." if c.earnings_date else "")
@@ -543,9 +571,11 @@ def main() -> int:
     failures: dict[str, str] = {}
     skipped: dict[str, str] = {}
 
+    ib = connect_ibkr()
     for sym in C.UNIVERSE:
         try:
             found = scan_ticker(sym, today)
+            add_iv_percentile(ib, sym, found)
             scanned += 1
             log.info("%s: %d candidates", sym, len(found))
             all_cands.extend(found)
@@ -555,6 +585,8 @@ def main() -> int:
             failures[sym] = str(e)
             log.error("%s: scan failed: %s", sym, e)
         time.sleep(0.3)  # be polite to Yahoo
+    if ib is not None:
+        ib.disconnect()
 
     ranked = score(all_cands)
     picks = pick_top(ranked)
