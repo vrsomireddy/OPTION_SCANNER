@@ -1008,3 +1008,81 @@ def test_put_quotes_wait_for_prices_and_greeks_to_arrive(monkeypatch, loose_conf
     ib.reqMktData = capture
     [q] = ps.get_put_quotes(ib, contracts)
     assert (q.delta, len(waits)) == (-0.2, 1)
+
+
+class Clock:
+    """Fake clock that only moves when the scanner waits, so wait times are exact."""
+
+    def __init__(self, monkeypatch, ib, on_wait=None):
+        self.now = 0.0
+        self.waits = 0
+        self.on_wait = on_wait
+        monkeypatch.setattr(ps.time, "monotonic", lambda: self.now)
+        ib.sleep = self.sleep
+
+    def sleep(self, seconds):
+        """Advance time and let the test deliver data mid-wait."""
+        self.now += seconds
+        self.waits += 1
+        if self.on_wait:
+            self.on_wait(self)
+
+
+def put_tickers(*quotes):
+    """Build put tickers with the given prices and greeks for the wait tests."""
+    return [PutTicker(SimpleNamespace(strike=90.0 - i), **q) for i, q in enumerate(quotes)]
+
+
+@pytest.fixture
+def quote_timing(monkeypatch):
+    """Use a 6 second limit and a 1.5 second quiet period for the wait tests."""
+    monkeypatch.setattr(C, "IBKR_QUOTE_TIMEOUT", 6)
+    monkeypatch.setattr(C, "IBKR_QUOTE_QUIET", 1.5)
+
+
+def test_put_without_bid_counts_as_ready(monkeypatch, quote_timing):
+    """Do not wait for a bid that far out-of-the-money puts may never have."""
+    ib = FakeIB()
+    clock = Clock(monkeypatch, ib)
+    ps.wait_for_quotes(ib, put_tickers({"bid": float("nan")}, {"bid": 0.0}))
+    assert clock.waits == 0
+
+
+@pytest.mark.parametrize("quote", [{"ask": float("nan")}, {"delta": None}, {"delta": float("nan")}])
+def test_put_without_ask_or_delta_is_not_ready(quote):
+    """Treat a put as unready until both its asking price and its delta have arrived."""
+    [t] = put_tickers(quote)
+    assert not ps.quote_is_complete(t)
+
+
+def test_wait_stops_once_quotes_go_quiet(monkeypatch, quote_timing):
+    """Stop waiting soon after data stops arriving, instead of using the full time limit."""
+    ib = FakeIB()
+    clock = Clock(monkeypatch, ib)
+    ps.wait_for_quotes(ib, put_tickers({}, {"bid": float("nan"), "ask": float("nan"), "delta": None}))
+    assert clock.now == pytest.approx(1.5)
+
+
+def test_quiet_period_restarts_when_new_data_arrives(monkeypatch, quote_timing):
+    """Keep waiting while data is still trickling in, and stop once every put is ready."""
+    tickers = put_tickers({}, {"bid": float("nan"), "ask": float("nan"), "delta": None})
+
+    def trickle(clock):
+        """Deliver the ask after 1.25 seconds and the greeks after 2.5 seconds."""
+        if clock.now == 1.25:
+            tickers[1].ask = 1.0
+        if clock.now == 2.5:
+            tickers[1].modelGreeks = SimpleNamespace(impliedVol=0.3, delta=-0.1)
+
+    ib = FakeIB()
+    clock = Clock(monkeypatch, ib, trickle)
+    ps.wait_for_quotes(ib, tickers)
+    assert clock.now == pytest.approx(2.5)
+
+
+def test_wait_uses_full_time_limit_while_nothing_has_arrived(monkeypatch, quote_timing):
+    """Keep waiting up to the time limit when no data has arrived at all, since the first quotes can be slow."""
+    ib = FakeIB()
+    clock = Clock(monkeypatch, ib)
+    ps.wait_for_quotes(ib, put_tickers({"bid": float("nan"), "ask": float("nan"), "delta": None}))
+    assert clock.now == pytest.approx(6.0)

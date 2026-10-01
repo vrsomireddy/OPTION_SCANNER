@@ -225,10 +225,34 @@ def get_put_contracts(ib: IB, stock: Stock, spot: float, keep_expiration) -> lis
     return [c for c in ib.qualifyContracts(*wanted) if c is not None and c.conId]
 
 
-def quote_is_complete(ticker) -> bool:
-    """Tell whether a put's price and greeks have both arrived."""
+def has_delta(ticker) -> bool:
+    """Tell whether a put's greeks have arrived."""
     g = ticker.modelGreeks
-    return positive(ticker.bid) and positive(ticker.ask) and g is not None and g.delta is not None and math.isfinite(g.delta)
+    return g is not None and g.delta is not None and math.isfinite(g.delta)
+
+
+def quote_is_complete(ticker) -> bool:
+    """Tell whether a put has enough data to judge it: greeks and an asking price (some puts have no bid)."""
+    return positive(ticker.ask) and has_delta(ticker)
+
+
+def quotes_arrived(tickers) -> tuple:
+    """Note which prices and greeks have shown up so far, ignoring their changing values."""
+    return tuple((positive(t.bid), positive(t.ask), has_delta(t)) for t in tickers)
+
+
+def wait_for_quotes(ib: IB, tickers) -> None:
+    """Wait until every put is ready, nothing new has arrived for a short while, or time runs out."""
+    start = time.monotonic()
+    deadline = start + C.IBKR_QUOTE_TIMEOUT
+    seen, last_change = quotes_arrived(tickers), start
+    while time.monotonic() < deadline and not all(quote_is_complete(t) for t in tickers):
+        ib.sleep(0.25)
+        now, arrived = time.monotonic(), quotes_arrived(tickers)
+        if arrived != seen:
+            seen, last_change = arrived, now
+        elif any(any(fields) for fields in seen) and now - last_change >= C.IBKR_QUOTE_QUIET:
+            return
 
 
 def get_put_quotes(ib: IB, contracts: list[Option]) -> list[PutQuote]:
@@ -236,9 +260,7 @@ def get_put_quotes(ib: IB, contracts: list[Option]) -> list[PutQuote]:
     quotes = []
     for i in range(0, len(contracts), C.IBKR_BATCH_SIZE):
         tickers = [ib.reqMktData(c, "", False, False) for c in contracts[i:i + C.IBKR_BATCH_SIZE]]
-        deadline = time.monotonic() + C.IBKR_QUOTE_TIMEOUT
-        while time.monotonic() < deadline and not all(quote_is_complete(t) for t in tickers):
-            ib.sleep(0.25)
+        wait_for_quotes(ib, tickers)
         for t in tickers:
             ib.cancelMktData(t.contract)
             g = t.modelGreeks

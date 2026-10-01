@@ -43,6 +43,7 @@ IBKR_TIMEOUT = 10           # seconds to wait for the connection
 IBKR_MARKET_DATA_TYPE = 2   # 1 live only; 2 live, or last values when the market is closed
 IBKR_BATCH_SIZE = 90        # puts priced at once (IBKR allows about 100 live quotes)
 IBKR_QUOTE_TIMEOUT = 6      # seconds to wait for a batch's prices and greeks
+IBKR_QUOTE_QUIET = 1.5      # stop waiting once no new prices or greeks arrive for this many seconds
 IV_LOOKBACK = "1 Y"         # implied-volatility history window
 IV_MIN_DAYS = 120           # fewer daily IV values than this = stock skipped
 
