@@ -1,8 +1,10 @@
 """Unit tests for put_scanner.py. All network calls (yfinance, SMTP) are mocked."""
+import logging
 import math
 import smtplib
 from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -89,33 +91,95 @@ class Bar:
         self.close = close
 
 
+class StockTicker:
+    def __init__(self, contract, price=100.0, close=float("nan"), av_volume=5_000_000.0):
+        self.contract = contract
+        self.price = price
+        self.close = close
+        self.avVolume = av_volume
+
+    def marketPrice(self):
+        return self.price
+
+
+class PutTicker:
+    def __init__(self, contract, bid=1.0, ask=1.1, iv=0.30, delta=-0.20, volume=50):
+        self.contract = contract
+        self.bid = bid
+        self.ask = ask
+        self.volume = volume
+        self.modelGreeks = None if delta is None else SimpleNamespace(impliedVol=iv, delta=delta)
+
+
 class FakeIB:
     """Stands in for an IBKR connection so tests never open a socket."""
 
-    def __init__(self, ivs=(), qualify=True, raises=False):
+    def __init__(self, ivs=(), qualify=True, raises=False, stock=None, chains=None, quotes=None,
+                 unlisted=(), secdef_raises=False, mktdata_raises=False):
         self.ivs = list(ivs)
         self.qualify = qualify
         self.raises = raises
+        self.stock = stock or {}
+        self.chains = chains if chains is not None else []
+        self.quotes = quotes or {}
+        self.unlisted = set(unlisted)
+        self.secdef_raises = secdef_raises
+        self.mktdata_raises = mktdata_raises
         self.requests = []
+        self.cancelled = []
+        self.batches = []
+        self.data_type = None
         self.disconnected = False
 
-    def qualifyContracts(self, contract):
+    def qualifyContracts(self, *contracts):
         if self.raises:
             raise RuntimeError("pacing violation")
-        return [contract] if self.qualify else []
+        if not self.qualify:
+            return []
+        out = []
+        for c in contracts:
+            if c.secType == "OPT" and (c.lastTradeDateOrContractMonth, c.strike) in self.unlisted:
+                out.append(None)
+            else:
+                c.conId = 1
+                out.append(c)
+        return out
 
     def reqHistoricalData(self, contract, **kwargs):
         self.requests.append((contract.symbol, kwargs["whatToShow"]))
         return [Bar(v) for v in self.ivs]
 
+    def reqSecDefOptParams(self, symbol, exchange, sec_type, con_id):
+        if self.secdef_raises:
+            raise RuntimeError("secdef failed")
+        return self.chains
+
+    def reqMktData(self, contract, generic="", snapshot=False, regulatory=False):
+        if self.mktdata_raises:
+            raise RuntimeError("no market data permissions")
+        if contract.secType == "OPT":
+            self.batches.append(contract.strike)
+            key = (contract.lastTradeDateOrContractMonth, contract.strike)
+            return PutTicker(contract, **self.quotes.get(key, {}))
+        return StockTicker(contract, **self.stock)
+
+    def cancelMktData(self, contract):
+        self.cancelled.append(contract)
+
+    def sleep(self, seconds):
+        pass
+
+    def reqMarketDataType(self, data_type):
+        self.data_type = data_type
+
     def disconnect(self):
         self.disconnected = True
 
 
-def make_put_row(**overrides):
-    row = dict(strike=90.0, bid=1.0, ask=1.1, impliedVolatility=0.30, openInterest=100, volume=50)
-    row.update(overrides)
-    return row
+def chain(expirations, strikes, exchange="SMART"):
+    """Describe one listed option chain the way IBKR reports it."""
+    return SimpleNamespace(exchange=exchange, tradingClass="AAA", multiplier="100",
+                           expirations=set(expirations), strikes=list(strikes))
 
 
 def make_candidate(**overrides):
@@ -127,76 +191,6 @@ def make_candidate(**overrides):
     )
     base.update(overrides)
     return ps.PutCandidate(**base)
-
-
-# ---------------------------------------------------------------------------
-# bs_put_delta
-# ---------------------------------------------------------------------------
-def test_bs_put_delta_normal_range():
-    d = ps.bs_put_delta(100, 90, 30 / 365, 0.04, 0.30)
-    assert -1.0 < d < 0.0
-
-
-@pytest.mark.parametrize(
-    "spot,strike,t_years,iv",
-    [(0, 90, 30 / 365, 0.3), (100, 0, 30 / 365, 0.3), (100, 90, 0, 0.3), (100, 90, 30 / 365, 0)],
-)
-def test_bs_put_delta_invalid_inputs_return_nan(spot, strike, t_years, iv):
-    assert math.isnan(ps.bs_put_delta(spot, strike, t_years, 0.04, iv))
-
-
-# ---------------------------------------------------------------------------
-# get_spot_and_volume
-# ---------------------------------------------------------------------------
-def test_get_spot_and_volume_fast_info_with_avg_volume():
-    tk = FakeTicker(fast_info={"last_price": 150.0, "ten_day_average_volume": 2_000_000})
-    spot, vol = ps.get_spot_and_volume(tk)
-    assert spot == 150.0
-    assert vol == 2_000_000
-    assert tk.history_calls == 0  # never needed the fallback
-
-
-def test_get_spot_and_volume_fast_info_falls_back_to_history_for_volume():
-    hist = pd.DataFrame({"Volume": [100, 200, 300]})
-    tk = FakeTicker(fast_info={"last_price": 50.0}, history_df=hist)
-    spot, vol = ps.get_spot_and_volume(tk)
-    assert spot == 50.0
-    assert vol == 200.0
-
-
-def test_get_spot_and_volume_fast_info_zero_avg_volume_and_empty_history():
-    tk = FakeTicker(fast_info={"last_price": 50.0}, history_df=pd.DataFrame())
-    spot, vol = ps.get_spot_and_volume(tk)
-    assert spot == 50.0
-    assert vol is None
-
-
-def test_get_spot_and_volume_fast_info_nonpositive_price_falls_through_to_history():
-    hist = pd.DataFrame({"Close": [10.0, 11.0], "Volume": [1000, 2000]})
-    tk = FakeTicker(fast_info={"last_price": 0.0}, history_df=hist)
-    spot, vol = ps.get_spot_and_volume(tk)
-    assert spot == 11.0
-    assert vol == 1500.0
-
-
-def test_get_spot_and_volume_fast_info_raises_uses_history():
-    hist = pd.DataFrame({"Close": [20.0, 22.0], "Volume": [10, 20]})
-    tk = FakeTicker(fast_info_raises=True, history_df=hist)
-    spot, vol = ps.get_spot_and_volume(tk)
-    assert spot == 22.0
-    assert vol == 15.0
-
-
-def test_get_spot_and_volume_fast_info_raises_and_history_empty():
-    tk = FakeTicker(fast_info_raises=True, history_df=pd.DataFrame())
-    spot, vol = ps.get_spot_and_volume(tk)
-    assert (spot, vol) == (None, None)
-
-
-def test_get_spot_and_volume_everything_fails():
-    tk = FakeTicker(fast_info_raises=True, history_raises=True)
-    spot, vol = ps.get_spot_and_volume(tk)
-    assert (spot, vol) == (None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -252,184 +246,6 @@ def test_get_next_earnings_calendar_has_no_future_dates():
     today = date.today()
     tk = FakeTicker(earnings_raises=True, calendar={"Earnings Date": [today - timedelta(days=1)]})
     assert ps.get_next_earnings(tk) is None
-
-
-# ---------------------------------------------------------------------------
-# scan_ticker
-# ---------------------------------------------------------------------------
-@pytest.fixture
-def loose_config(monkeypatch):
-    """Wide-open filters so scan_ticker tests can isolate one condition at a time."""
-    monkeypatch.setattr(C, "MAX_STOCK_PRICE", None)
-    monkeypatch.setattr(C, "MIN_AVG_STOCK_VOLUME", 0)
-    monkeypatch.setattr(C, "SKIP_EARNINGS", False)
-    monkeypatch.setattr(C, "DTE_MIN", 1)
-    monkeypatch.setattr(C, "DTE_MAX", 60)
-    monkeypatch.setattr(C, "MIN_BID", 0.10)
-    monkeypatch.setattr(C, "MIN_OPEN_INTEREST", 10)
-    monkeypatch.setattr(C, "MAX_SPREAD_PCT", 0.5)
-    monkeypatch.setattr(C, "DELTA_MIN", 0.0)
-    monkeypatch.setattr(C, "DELTA_MAX", 1.0)
-    monkeypatch.setattr(C, "MIN_ANNUALIZED_RETURN", 0.0)
-    monkeypatch.setattr(C, "RISK_FREE_RATE", 0.04)
-    monkeypatch.setattr(C, "MAX_COLLATERAL", None)
-    monkeypatch.setattr(C, "EXCLUDE_TICKERS", [])
-    return C
-
-
-def _install_ticker(monkeypatch, fake_tk):
-    monkeypatch.setattr(ps.yf, "Ticker", lambda symbol: fake_tk)
-
-
-def test_scan_ticker_no_spot_reports_failure(monkeypatch, loose_config):
-    """Check that unavailable data and excluded stocks have distinct outcomes."""
-    tk = FakeTicker(fast_info_raises=True, history_raises=True)
-    _install_ticker(monkeypatch, tk)
-    with pytest.raises(ps.ScanDataError, match="stock price unavailable"):
-        ps.scan_ticker("AAA", date.today())
-
-
-def test_scan_ticker_price_too_high_skips(monkeypatch, loose_config):
-    """Check that unavailable data and excluded stocks have distinct outcomes."""
-    monkeypatch.setattr(C, "MAX_STOCK_PRICE", 50)
-    tk = FakeTicker(fast_info={"last_price": 100.0, "ten_day_average_volume": 5_000_000})
-    _install_ticker(monkeypatch, tk)
-    with pytest.raises(ps.ScanSkipped, match="stock price exceeds limit"):
-        ps.scan_ticker("AAA", date.today())
-
-
-def test_scan_ticker_low_volume_skips(monkeypatch, loose_config):
-    """Check that unavailable data and excluded stocks have distinct outcomes."""
-    monkeypatch.setattr(C, "MIN_AVG_STOCK_VOLUME", 1_000_000)
-    tk = FakeTicker(fast_info={"last_price": 100.0, "ten_day_average_volume": 500})
-    _install_ticker(monkeypatch, tk)
-    with pytest.raises(ps.ScanSkipped, match="average stock volume below limit"):
-        ps.scan_ticker("AAA", date.today())
-
-
-def test_scan_ticker_no_option_chain_reports_failure(monkeypatch, loose_config):
-    """Check that unavailable data and excluded stocks have distinct outcomes."""
-    tk = FakeTicker(fast_info={"last_price": 100.0, "ten_day_average_volume": 5_000_000}, options_raises=True)
-    _install_ticker(monkeypatch, tk)
-    with pytest.raises(ps.ScanDataError, match="option expirations unavailable"):
-        ps.scan_ticker("AAA", date.today())
-
-
-def test_scan_ticker_dte_out_of_window_skips(monkeypatch, loose_config):
-    monkeypatch.setattr(C, "DTE_MIN", 21)
-    monkeypatch.setattr(C, "DTE_MAX", 45)
-    today = date.today()
-    exp_str = (today + timedelta(days=5)).isoformat()
-    tk = FakeTicker(
-        fast_info={"last_price": 100.0, "ten_day_average_volume": 5_000_000},
-        options=(exp_str,),
-        option_chains={exp_str: Chain(pd.DataFrame([make_put_row()]))},
-    )
-    _install_ticker(monkeypatch, tk)
-    assert ps.scan_ticker("AAA", today) == []
-
-
-def test_scan_ticker_earnings_within_window_skips_that_expiration(monkeypatch, loose_config):
-    monkeypatch.setattr(C, "SKIP_EARNINGS", True)
-    today = date.today()
-    exp_str = (today + timedelta(days=30)).isoformat()
-    earnings_idx = pd.to_datetime([today + timedelta(days=10)])
-    tk = FakeTicker(
-        fast_info={"last_price": 100.0, "ten_day_average_volume": 5_000_000},
-        earnings_df=pd.DataFrame({"x": [1]}, index=earnings_idx),
-        options=(exp_str,),
-        option_chains={exp_str: Chain(pd.DataFrame([make_put_row()]))},
-    )
-    _install_ticker(monkeypatch, tk)
-    assert ps.scan_ticker("AAA", today) == []
-
-
-def test_scan_ticker_chain_fetch_failure_is_reported(monkeypatch, loose_config):
-    """Check that unavailable data and excluded stocks have distinct outcomes."""
-    today = date.today()
-    exp_str = (today + timedelta(days=30)).isoformat()
-
-    class RaisingChainTicker(FakeTicker):
-        def option_chain(self, exp_str):
-            raise RuntimeError("chain fetch failed")
-
-    tk = RaisingChainTicker(fast_info={"last_price": 100.0, "ten_day_average_volume": 5_000_000}, options=(exp_str,))
-    _install_ticker(monkeypatch, tk)
-    with pytest.raises(ps.ScanDataError, match="option chain unavailable"):
-        ps.scan_ticker("AAA", today)
-
-
-def test_scan_ticker_empty_puts_reports_failure(monkeypatch, loose_config):
-    """Check that unavailable data and excluded stocks have distinct outcomes."""
-    today = date.today()
-    exp_str = (today + timedelta(days=30)).isoformat()
-    tk = FakeTicker(
-        fast_info={"last_price": 100.0, "ten_day_average_volume": 5_000_000},
-        options=(exp_str,),
-        option_chains={exp_str: Chain(pd.DataFrame())},
-    )
-    _install_ticker(monkeypatch, tk)
-    with pytest.raises(ps.ScanDataError, match="put chain empty"):
-        ps.scan_ticker("AAA", today)
-
-
-def _scan_with_row(monkeypatch, row, today=None):
-    today = today or date.today()
-    exp_str = (today + timedelta(days=30)).isoformat()
-    tk = FakeTicker(
-        fast_info={"last_price": 100.0, "ten_day_average_volume": 5_000_000},
-        options=(exp_str,),
-        option_chains={exp_str: Chain(pd.DataFrame([row]))},
-    )
-    _install_ticker(monkeypatch, tk)
-    return ps.scan_ticker("AAA", today)
-
-
-def test_scan_ticker_accepts_a_qualifying_put(monkeypatch, loose_config):
-    out = _scan_with_row(monkeypatch, make_put_row())
-    assert len(out) == 1
-    c = out[0]
-    assert c.ticker == "AAA"
-    assert c.strike == 90.0
-    assert c.premium_per_contract == 100.0
-    assert c.collateral == 9000.0
-    assert c.breakeven == 89.0
-    assert c.cushion_pct == 0.10
-    assert c.earnings_date is None
-
-
-@pytest.mark.parametrize(
-    "row",
-    [
-        make_put_row(strike=100.0),          # not OTM
-        make_put_row(bid=0.05),              # below MIN_BID
-        make_put_row(ask=0.0),               # no ask
-        make_put_row(ask=0.5, bid=1.0),      # ask < bid
-        make_put_row(openInterest=1),        # too little open interest
-        make_put_row(ask=5.0, bid=1.0),      # spread too wide
-        make_put_row(impliedVolatility=0.0),  # delta becomes nan
-    ],
-)
-def test_scan_ticker_rejects_rows_that_fail_a_filter(monkeypatch, loose_config, row):
-    assert _scan_with_row(monkeypatch, row) == []
-
-
-def test_scan_ticker_rejects_delta_outside_band(monkeypatch, loose_config):
-    monkeypatch.setattr(C, "DELTA_MIN", 0.90)
-    monkeypatch.setattr(C, "DELTA_MAX", 0.99)
-    assert _scan_with_row(monkeypatch, make_put_row()) == []
-
-
-def test_scan_ticker_rejects_low_annualized_return(monkeypatch, loose_config):
-    monkeypatch.setattr(C, "MIN_ANNUALIZED_RETURN", 10.0)
-    assert _scan_with_row(monkeypatch, make_put_row()) == []
-
-
-def test_scan_ticker_handles_missing_values_in_row(monkeypatch, loose_config):
-    row = make_put_row(bid=float("nan"), ask=float("nan"), impliedVolatility=float("nan"),
-                        openInterest=float("nan"), volume=float("nan"))
-    # all-NaN numeric fields default to 0/0.0, which then fails the MIN_BID filter.
-    assert _scan_with_row(monkeypatch, row) == []
 
 
 # ---------------------------------------------------------------------------
@@ -638,7 +454,7 @@ def test_main_full_run_writes_reports_and_sends_notifications(monkeypatch, main_
     monkeypatch.setenv("EMAIL_TO", "to@example.com")
     monkeypatch.setenv("SMS_TO", "+15551234567")
 
-    def fake_scan(symbol, today):
+    def fake_scan(symbol, today, ib):
         if symbol == "AAA":
             return [make_candidate(ticker="AAA")]
         raise RuntimeError("yahoo hiccup")  # exercises the per-symbol error handling
@@ -664,7 +480,7 @@ def test_main_full_run_writes_reports_and_sends_notifications(monkeypatch, main_
 def test_main_full_run_no_candidates_writes_empty_csv(monkeypatch, main_env):
     """Write an empty candidate table when no contracts qualify."""
     monkeypatch.setattr(ps.sys, "argv", ["put_scanner.py"])
-    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today: [])
+    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today, ib: [])
 
     assert ps.main() == 0
     assert pd.read_csv(next(main_env.glob("all_candidates_*.csv"))).empty
@@ -676,32 +492,13 @@ def test_main_notification_failures_return_error(monkeypatch, main_env):
     monkeypatch.setattr(ps.sys, "argv", ["put_scanner.py"])
     monkeypatch.setenv("EMAIL_TO", "to@example.com")
     monkeypatch.setenv("SMS_TO", "+15551234567")
-    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today: [])
+    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today, ib: [])
 
     def boom(*a, **k):
         raise RuntimeError("network down")
 
     monkeypatch.setattr(ps, "send_email", boom)
     assert ps.main() == 1
-
-
-@pytest.mark.parametrize("volume", [None, 0, float("nan"), float("inf")])
-def test_scan_rejects_unknown_required_volume(monkeypatch, loose_config, volume):
-    """Exclude stocks whose required trading volume cannot be verified."""
-    monkeypatch.setattr(C, "MIN_AVG_STOCK_VOLUME", 1_000_000)
-    monkeypatch.setattr(ps, "get_spot_and_volume", lambda tk: (100, volume))
-    _install_ticker(monkeypatch, FakeTicker())
-    with pytest.raises(ps.ScanDataError, match="volume unavailable"):
-        ps.scan_ticker("AAA", date.today())
-
-
-def test_scan_rejects_unknown_earnings(monkeypatch, loose_config):
-    """Exclude stocks when the enabled earnings check cannot be completed."""
-    monkeypatch.setattr(C, "SKIP_EARNINGS", True)
-    tk = FakeTicker(fast_info={"last_price": 100, "ten_day_average_volume": 2_000_000})
-    _install_ticker(monkeypatch, tk)
-    with pytest.raises(ps.ScanDataError, match="earnings date unavailable"):
-        ps.scan_ticker("AAA", date.today())
 
 
 @pytest.mark.parametrize("value", [datetime(2020, 1, 5), pd.Timestamp("2020-01-05", tz="UTC")])
@@ -732,11 +529,11 @@ def test_email_check_missing_credentials_fails(monkeypatch, main_env):
 def test_empty_rerun_replaces_previous_csv(monkeypatch, main_env):
     """Remove old candidates from the daily table when a rerun finds none."""
     monkeypatch.setattr(ps.sys, "argv", ["put_scanner.py"])
-    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today: [make_candidate(ticker=symbol)])
+    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today, ib: [make_candidate(ticker=symbol)])
     assert ps.main() == 0
     csv = next(main_env.glob("all_candidates_*.csv"))
     assert len(pd.read_csv(csv)) == 2
-    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today: [])
+    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today, ib: [])
     assert ps.main() == 0
     assert pd.read_csv(csv).empty
     assert "No contracts met" in next(main_env.glob("puts_*.md")).read_text()
@@ -749,7 +546,7 @@ def test_total_outage_is_not_a_successful_empty_scan(monkeypatch, main_env, caps
     sent = []
     monkeypatch.setattr(ps, "send_email", lambda *args: sent.append(args))
 
-    def fail(symbol, today):
+    def fail(symbol, today, ib):
         """Represent a stock whose data could not be fetched."""
         raise ps.ScanDataError("stock price unavailable")
 
@@ -766,7 +563,7 @@ def test_skipped_stocks_are_reported_separately(monkeypatch, main_env, capsys):
     """Distinguish intentional exclusions from completed scans and data failures."""
     monkeypatch.setattr(ps.sys, "argv", ["put_scanner.py"])
 
-    def skip(symbol, today):
+    def skip(symbol, today, ib):
         """Represent a stock excluded by the price limit."""
         raise ps.ScanSkipped("stock price exceeds limit")
 
@@ -775,13 +572,6 @@ def test_skipped_stocks_are_reported_separately(monkeypatch, main_env, capsys):
     report = capsys.readouterr().out
     assert "Stocks skipped before contract evaluation: 2" in report
     assert "INCOMPLETE" not in report
-
-
-def test_no_listed_expirations_is_a_skip(monkeypatch, loose_config):
-    """Treat stocks with no listed options as intentional exclusions."""
-    _install_ticker(monkeypatch, FakeTicker(fast_info={"last_price": 100}))
-    with pytest.raises(ps.ScanSkipped, match="no listed option expirations"):
-        ps.scan_ticker("AAA", date.today())
 
 
 def test_alternatives_keep_rank_order_and_exclude_all_top_names(monkeypatch):
@@ -866,7 +656,7 @@ def test_main_reports_alternatives_changes_and_persists_selections(monkeypatch, 
     monkeypatch.setattr(ps.sys, "argv", ["put_scanner.py"])
     monkeypatch.setattr(C, "TOP_N", 1)
     monkeypatch.setattr(C, "ALTERNATIVE_N", 1)
-    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today: [make_candidate(ticker=symbol, dte=29)])
+    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today, ib: [make_candidate(ticker=symbol, dte=29)])
     previous_day = date.today() - timedelta(days=1)
     pd.DataFrame([asdict(make_candidate(ticker="AAA", dte=30))]).to_csv(
         main_env / f"all_candidates_{previous_day}.csv", index=False,
@@ -892,7 +682,7 @@ def test_main_reports_alternatives_changes_and_persists_selections(monkeypatch, 
 
 
 # ---------------------------------------------------------------------------
-# realized volatility and portfolio limits
+# IV percentile and portfolio limits
 # ---------------------------------------------------------------------------
 def test_iv_percentile_compares_today_with_past_year(monkeypatch):
     """Place today's implied vol among the stock's earlier daily values."""
@@ -936,11 +726,15 @@ def test_connect_ibkr_is_read_only_and_skips_account_data(monkeypatch):
         def connect(self, host, port, **kwargs):
             calls.update(kwargs, host=host, port=port)
 
+        def reqMarketDataType(self, data_type):
+            calls["data_type"] = data_type
+
     monkeypatch.setattr(ps, "IB", FakeClient)
     assert isinstance(ps.connect_ibkr(), FakeClient)
     assert calls["readonly"] is True
     assert calls["fetchFields"] == ps.StartupFetch(0)
     assert (calls["host"], calls["port"]) == (C.IBKR_HOST, C.IBKR_PORT)
+    assert calls["data_type"] == C.IBKR_MARKET_DATA_TYPE
 
 
 def test_connect_ibkr_failure_returns_none(monkeypatch):
@@ -957,7 +751,7 @@ def test_main_without_ibkr_marks_stocks_with_candidates_incomplete(monkeypatch, 
     """Never rank picks without IV history; label the run incomplete instead."""
     monkeypatch.setattr(ps.sys, "argv", ["put_scanner.py"])
     monkeypatch.setattr(ps, "connect_ibkr", lambda: None)
-    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today: [make_candidate(ticker=symbol)])
+    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today, ib: [make_candidate(ticker=symbol)])
     assert ps.main() == 1
     report = capsys.readouterr().out
     assert "IBKR not connected" in report
@@ -969,25 +763,9 @@ def test_main_disconnects_from_ibkr(monkeypatch, main_env):
     monkeypatch.setattr(ps.sys, "argv", ["put_scanner.py"])
     ib = FakeIB(ivs=[0.2, 0.3, 0.4, 0.5])
     monkeypatch.setattr(ps, "connect_ibkr", lambda: ib)
-    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today: [make_candidate(ticker=symbol)])
+    monkeypatch.setattr(ps, "scan_ticker", lambda symbol, today, ib: [make_candidate(ticker=symbol)])
     assert ps.main() == 0
     assert ib.disconnected
-
-
-def test_scan_skips_excluded_tickers_before_fetching(monkeypatch, loose_config):
-    """Skip configured names without requesting any market data."""
-    monkeypatch.setattr(C, "EXCLUDE_TICKERS", ["AAA"])
-    monkeypatch.setattr(ps.yf, "Ticker", lambda symbol: pytest.fail("should not fetch"))
-    with pytest.raises(ps.ScanSkipped, match="excluded in config"):
-        ps.scan_ticker("AAA", date.today())
-
-
-def test_scan_drops_contracts_above_collateral_limit(monkeypatch, loose_config):
-    """Leave out puts that would tie up more cash than the configured limit."""
-    monkeypatch.setattr(C, "MAX_COLLATERAL", 8_000)
-    assert _scan_with_row(monkeypatch, make_put_row(strike=90.0)) == []
-    monkeypatch.setattr(C, "MAX_COLLATERAL", 9_000)
-    assert len(_scan_with_row(monkeypatch, make_put_row(strike=90.0))) == 1
 
 
 def test_sector_group_limit_applies_across_picks_and_alternatives(monkeypatch):
@@ -1022,3 +800,211 @@ def test_previous_scan_loads_files_written_before_richness_existed(tmp_path):
     previous = ps.load_previous_scan(tmp_path, date(2026, 9, 11))
     assert [c.ticker for c in previous.displayed] == ["OLD"]
     assert math.isnan(previous.candidates[0].iv_percentile)
+
+
+# ---------------------------------------------------------------------------
+# IBKR market data and scan_ticker
+# ---------------------------------------------------------------------------
+TODAY = date(2026, 9, 30)
+EXP = "20261030"          # 30 days out, IBKR format
+EXP_ISO = "2026-10-30"
+
+
+@pytest.fixture
+def loose_config(monkeypatch):
+    """Wide-open filters so scan tests can isolate one condition at a time."""
+    for name, value in [("MAX_STOCK_PRICE", None), ("MIN_AVG_STOCK_VOLUME", 0), ("SKIP_EARNINGS", False),
+                        ("DTE_MIN", 1), ("DTE_MAX", 60), ("MIN_BID", 0.10), ("MIN_OPEN_INTEREST", 10),
+                        ("MAX_SPREAD_PCT", 0.5), ("DELTA_MIN", 0.0), ("DELTA_MAX", 1.0), ("MIN_ANNUALIZED_RETURN", 0.0),
+                        ("MAX_COLLATERAL", None), ("EXCLUDE_TICKERS", []), ("STRIKE_WINDOW", 0.30),
+                        ("IBKR_BATCH_SIZE", 90), ("IBKR_QUOTE_TIMEOUT", 0)]:
+        monkeypatch.setattr(C, name, value)
+    return C
+
+
+def install_yahoo(monkeypatch, open_interest=None, **ticker_kwargs):
+    """Serve open interest (and optionally earnings) from a fake Yahoo ticker."""
+    rows = open_interest if open_interest is not None else {90.0: 100}
+    puts = pd.DataFrame([{"strike": k, "openInterest": v} for k, v in rows.items()])
+    tk = FakeTicker(option_chains={EXP_ISO: Chain(puts)}, **ticker_kwargs)
+    monkeypatch.setattr(ps.yf, "Ticker", lambda symbol: tk)
+    return tk
+
+
+def scan(monkeypatch, ib=None, open_interest=None, **ticker_kwargs):
+    """Run one stock through the scanner against fake IBKR and Yahoo data."""
+    install_yahoo(monkeypatch, open_interest, **ticker_kwargs)
+    ib = ib or FakeIB(chains=[chain([EXP], [90.0])])
+    return ps.scan_ticker("AAA", TODAY, ib)
+
+
+def test_scan_accepts_a_qualifying_put(monkeypatch, loose_config):
+    """Combine IBKR prices and greeks with Yahoo open interest into one suggestion."""
+    [c] = scan(monkeypatch)
+    assert (c.ticker, c.expiration, c.dte, c.strike) == ("AAA", EXP_ISO, 30, 90.0)
+    assert (c.bid, c.ask, c.iv, c.delta, c.open_interest, c.volume) == (1.0, 1.1, 0.3, -0.2, 100, 50)
+    assert (c.premium_per_contract, c.collateral, c.breakeven, c.cushion_pct) == (100.0, 9000.0, 89.0, 0.10)
+
+
+@pytest.mark.parametrize("quote,open_interest", [
+    ({"bid": 0.05}, None),                       # below MIN_BID
+    ({"bid": 0.0, "ask": 1.0}, None),            # no bid
+    ({"bid": 1.0, "ask": 0.5}, None),            # ask below bid
+    ({"bid": 1.0, "ask": 5.0}, None),            # spread too wide
+    ({"delta": None}, None),                     # no greeks from IBKR
+    ({}, {90.0: 1}),                             # too little open interest
+    ({}, {85.0: 1000}),                          # open interest missing for this strike
+])
+def test_scan_rejects_puts_that_fail_a_filter(monkeypatch, loose_config, quote, open_interest):
+    """Drop puts whose price, greeks, or open interest do not meet the filters."""
+    ib = FakeIB(chains=[chain([EXP], [90.0])], quotes={(EXP, 90.0): quote})
+    assert scan(monkeypatch, ib, open_interest) == []
+
+
+def test_scan_rejects_delta_and_return_outside_limits(monkeypatch, loose_config):
+    """Apply the delta band and the minimum annualized return."""
+    monkeypatch.setattr(C, "DELTA_MIN", 0.5)
+    assert scan(monkeypatch) == []
+    monkeypatch.setattr(C, "DELTA_MIN", 0.0)
+    monkeypatch.setattr(C, "MIN_ANNUALIZED_RETURN", 10.0)
+    assert scan(monkeypatch) == []
+
+
+def test_put_contracts_limit_expirations_strikes_and_collateral(monkeypatch, loose_config):
+    """Price only listed puts in the day window, just below the stock price, within the cash limit."""
+    monkeypatch.setattr(C, "MAX_COLLATERAL", 8_600)
+    ib = FakeIB(chains=[chain([EXP, "20261231"], [60.0, 80.0, 85.0, 86.0, 90.0, 100.0, 110.0]),
+                        chain([EXP], [75.0], exchange="CBOE")],
+                unlisted={(EXP, 85.0)})
+    stock = ps.get_stock(ib, "AAA")
+    got = ps.get_put_contracts(ib, stock, 100.0, lambda exp: exp == EXP)
+    # 60 is outside the 30% window, 90+ need too much cash or are not below spot, 85 is not listed, CBOE is ignored.
+    assert [(c.lastTradeDateOrContractMonth, c.strike) for c in got] == [(EXP, 80.0), (EXP, 86.0)]
+    assert ps.get_put_contracts(ib, stock, 100.0, lambda exp: False) == []
+
+
+def test_scan_skips_expirations_outside_window_or_spanning_earnings(monkeypatch, loose_config):
+    """Leave out expirations that are too near, too far, or after the next earnings report."""
+    monkeypatch.setattr(C, "DTE_MIN", 31)
+    assert scan(monkeypatch) == []
+    monkeypatch.setattr(C, "DTE_MIN", 1)
+    monkeypatch.setattr(C, "SKIP_EARNINGS", True)
+    earnings = pd.DataFrame({"x": [1]}, index=pd.to_datetime([TODAY + timedelta(days=10)]))
+    assert scan(monkeypatch, earnings_df=earnings) == []
+    later = pd.DataFrame({"x": [1]}, index=pd.to_datetime([TODAY + timedelta(days=40)]))
+    assert scan(monkeypatch, earnings_df=later)[0].earnings_date == "2026-11-09"
+
+
+def test_scan_quotes_in_batches_and_cancels_every_request(monkeypatch, loose_config):
+    """Stay under IBKR's live-quote limit and release every quote after reading it."""
+    monkeypatch.setattr(C, "IBKR_BATCH_SIZE", 2)
+    ib = FakeIB(chains=[chain([EXP], [80.0, 85.0, 90.0])])
+    scan(monkeypatch, ib, {80.0: 100, 85.0: 100, 90.0: 100})
+    assert ib.batches == [80.0, 85.0, 90.0]
+    assert len([c for c in ib.cancelled if c.secType == "OPT"]) == 3
+
+
+@pytest.mark.parametrize("ib,error", [
+    (None, "IBKR not connected"),
+    (FakeIB(qualify=False), "stock not found at IBKR"),
+    (FakeIB(raises=True), "stock not found at IBKR"),
+    (FakeIB(stock={"price": float("nan")}), "stock price unavailable"),
+    (FakeIB(mktdata_raises=True), "stock price unavailable"),
+    (FakeIB(secdef_raises=True), "option chain unavailable"),
+    (FakeIB(chains=[chain([EXP], [90.0])], quotes={(EXP, 90.0): {"bid": 0.0, "ask": 0.0}}), "no option quotes"),
+])
+def test_scan_reports_data_failures(monkeypatch, loose_config, ib, error):
+    """Mark a stock as failed when IBKR cannot supply its required data."""
+    install_yahoo(monkeypatch)
+    with pytest.raises(ps.ScanDataError, match=error):
+        ps.scan_ticker("AAA", TODAY, ib)
+
+
+@pytest.mark.parametrize("volume", [None, float("nan"), 0.0])
+def test_scan_rejects_unknown_required_volume(monkeypatch, loose_config, volume):
+    """Exclude stocks whose required trading volume cannot be verified."""
+    monkeypatch.setattr(C, "MIN_AVG_STOCK_VOLUME", 1_000_000)
+    with pytest.raises(ps.ScanDataError, match="volume unavailable"):
+        scan(monkeypatch, FakeIB(stock={"av_volume": volume}))
+
+
+def test_scan_rejects_unknown_earnings(monkeypatch, loose_config):
+    """Exclude stocks when the enabled earnings check cannot be completed."""
+    monkeypatch.setattr(C, "SKIP_EARNINGS", True)
+    with pytest.raises(ps.ScanDataError, match="earnings date unavailable"):
+        scan(monkeypatch)
+
+
+@pytest.mark.parametrize("setup,ib,reason", [
+    ({"EXCLUDE_TICKERS": ["AAA"]}, None, "excluded in config"),
+    ({"MAX_STOCK_PRICE": 50}, FakeIB(), "stock price exceeds limit"),
+    ({"MIN_AVG_STOCK_VOLUME": 10_000_000}, FakeIB(), "average stock volume below limit"),
+    ({}, FakeIB(chains=[chain([EXP], [90.0], exchange="CBOE")]), "no listed option expirations"),
+])
+def test_scan_skips_stocks_by_rule(monkeypatch, loose_config, setup, ib, reason):
+    """Skip stocks excluded by configuration or with no SMART-routed options, without failing the run."""
+    for name, value in setup.items():
+        monkeypatch.setattr(C, name, value)
+    install_yahoo(monkeypatch)
+    with pytest.raises(ps.ScanSkipped, match=reason):
+        ps.scan_ticker("AAA", TODAY, ib)
+
+
+def test_spot_falls_back_to_close_when_no_live_price(monkeypatch):
+    """Use the last close when the market is shut and no live price is available."""
+    monkeypatch.setattr(C, "IBKR_QUOTE_TIMEOUT", 0)
+    ib = FakeIB(stock={"price": float("nan"), "close": 99.5})
+    assert ps.get_spot_and_volume(ib, ps.get_stock(ib, "AAA")) == (99.5, 5_000_000.0)
+
+
+def test_open_interest_skips_expirations_yahoo_cannot_supply():
+    """Keep open interest from expirations that loaded and ignore missing values."""
+    puts = pd.DataFrame([{"strike": 90.0, "openInterest": 700}, {"strike": 85.0, "openInterest": float("nan")}])
+
+    class PartlyBroken(FakeTicker):
+        def option_chain(self, exp_str):
+            if exp_str == "2026-11-06":
+                raise RuntimeError("yahoo hiccup")
+            return Chain(puts)
+
+    got = ps.get_open_interest(PartlyBroken(), {EXP_ISO, "2026-11-06"})
+    assert got == {(EXP_ISO, 90.0): 700}
+
+
+def test_missing_strike_notices_are_hidden_from_logs():
+    """Hide IBKR's expected notices about strikes that are not listed, but keep other errors."""
+    f = ps.HideMissingStrikes()
+
+    def record(msg):
+        return logging.LogRecord("ib_async.wrapper", logging.ERROR, "", 0, msg, None, None)
+
+    assert not f.filter(record("Error 200, reqId 11: No security definition has been found"))
+    assert not f.filter(record("Unknown contract: Option(symbol='AAA')"))
+    assert f.filter(record("Error 354: Requested market data is not subscribed"))
+
+
+def test_put_quotes_wait_for_prices_and_greeks_to_arrive(monkeypatch, loose_config):
+    """Keep listening until each put's price and greeks have arrived, then stop early."""
+    monkeypatch.setattr(C, "IBKR_QUOTE_TIMEOUT", 30)
+    ib = FakeIB(chains=[chain([EXP], [90.0])], quotes={(EXP, 90.0): {"delta": None}})
+    waits = []
+
+    def arrive(seconds):
+        """Deliver the greeks on the first wait."""
+        waits.append(seconds)
+        ticker.modelGreeks = SimpleNamespace(impliedVol=0.3, delta=-0.2)
+
+    ib.sleep = arrive
+    contracts = ps.get_put_contracts(ib, ps.get_stock(ib, "AAA"), 100.0, lambda exp: True)
+    real_req = ib.reqMktData
+
+    def capture(*args):
+        """Remember the ticker so the fake can update it while waiting."""
+        nonlocal ticker
+        ticker = real_req(*args)
+        return ticker
+
+    ticker = None
+    ib.reqMktData = capture
+    [q] = ps.get_put_quotes(ib, contracts)
+    assert (q.delta, len(waits)) == (-0.2, 1)

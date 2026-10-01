@@ -1,19 +1,29 @@
 # Daily Cash-Secured Put Scanner (Nasdaq-100 Tech)
 
-Suggestions only. No order placement. Reads implied-volatility history from
-Interactive Brokers over a read-only API connection (see [IBKR setup](#ibkr-setup)).
+Suggestions only. No order placement. Market data comes from Interactive Brokers
+over a read-only API connection (see [IBKR setup](#ibkr-setup)).
+
+| Data | Source |
+|------|--------|
+| Stock price, 90-day average volume | IBKR |
+| Option expirations and strikes | IBKR |
+| Put bid/ask, implied vol, delta | IBKR (live; IBKR's own option model) |
+| Stock IV history for the IV percentile | IBKR |
+| Earnings dates | Yahoo Finance (IBKR sells these only as a paid add-on) |
+| Open interest | Yahoo Finance (published once a day, so Yahoo's delay does not matter; IBKR's open-interest feed proved unreliable) |
 
 ## What it does
 
 Each run:
-1. Pulls fresh quotes and option chains from Yahoo Finance for the tickers in `config.py`,
+1. Pulls the stock price and option chain from IBKR for each ticker in `config.py`,
    skipping any listed in `EXCLUDE_TICKERS` (e.g. stocks you already hold).
-2. Drops underlyings with thin volume (`MIN_AVG_STOCK_VOLUME`, 1M shares/day) or
+2. Drops underlyings with thin volume (`MIN_AVG_STOCK_VOLUME`, 1M shares/day, IBKR's 90-day average) or
    priced above `MAX_STOCK_PRICE` — that price cap is currently `None`, i.e. disabled.
 3. Looks at every expiration 21–45 DTE, skipping any that spans the next earnings date.
    Stocks with unknown earnings dates or missing required average volume are excluded
    and recorded as data failures.
-4. For each OTM put: computes Black-Scholes delta from the quoted implied vol,
+4. Requests live quotes for puts with strikes up to `STRIKE_WINDOW` (30%) below the stock price,
+   in batches of `IBKR_BATCH_SIZE` (IBKR allows about 100 live quotes at once), then
    keeps |Δ| 0.15–0.25, OI ≥ 500, bid ≥ $0.20, bid-ask ≤ 10%, collateral ≤ `MAX_COLLATERAL`
    ($30,000), and **annualized return on collateral ≥ 15%** where `annualized = bid / strike × 365 / DTE`.
 5. For each stock that still has candidates, asks IBKR for a year of daily implied
@@ -101,9 +111,11 @@ The scan needs IB Gateway (or TWS) running and logged in when it starts.
    time outside 10:00 ET, and log in again when prompted, or the scan cannot reach it.
 
 The connection is opened with `readonly=True` and does not download positions, orders, or
-balances. The project contains no order code. If Gateway is unreachable, every stock with
-candidates is reported as a data failure and the run is marked INCOMPLETE, so the scanner never
-ranks picks without IV history.
+balances. The project contains no order code. If Gateway is unreachable, every stock is
+reported as a data failure and the run is marked INCOMPLETE; there is no Yahoo fallback for quotes.
+
+`IBKR_MARKET_DATA_TYPE = 2` returns live data while the market is open and the last values
+when it is closed. After-hours option spreads are wide, so an evening run finds few or no puts.
 
 ## Email / SMS
 
@@ -172,9 +184,7 @@ All knobs are in `config.py`. Common tweaks:
   to disable alternatives. Fewer are shown when too few additional names qualify.
 
 ## Caveats
-- Yahoo data is ~15 min delayed and occasionally stale/missing; treat bids as approximate and confirm on IBKR before entering an order.
-- IV percentile comes from IBKR's daily stock-level implied volatility; per-contract IV and delta
-  still come from Yahoo.
-- Delta is computed from Yahoo's IV, not read from the exchange, so it can differ slightly from your broker's Greeks.
+- Quotes are live at scan time and will have moved by the time you trade; confirm on IBKR before entering an order.
+- Open interest is the previous day's figure from Yahoo; a contract missing from Yahoo's chain is dropped.
 - The scan runs on market holidays too and will email a report built from the previous session's stale quotes. Check the date before acting on a holiday-morning email.
 - Not financial advice.

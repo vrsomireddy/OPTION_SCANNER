@@ -29,18 +29,20 @@ DTE_MIN = 21                # days to expiration
 DTE_MAX = 45
 MIN_ANNUALIZED_RETURN = 0.15   # 15% annualized on cash collateral (strike x 100)
 MAX_STOCK_PRICE = None     # No max price
-SKIP_EARNINGS = True        # drop expirations that span an earnings date
-RISK_FREE_RATE = 0.04       # used in Black-Scholes delta
+SKIP_EARNINGS = True        # drop expirations that span an earnings date (dates from Yahoo Finance)
+STRIKE_WINDOW = 0.30        # price puts with strikes up to 30% below the stock price
 
 # ---------------------------------------------------------------------------
-# Premium richness: where today's implied vol sits in the stock's past year.
-# Read from IBKR (IB Gateway or TWS must be running with the API enabled).
+# IBKR market data (IB Gateway or TWS must be running with the API enabled).
 # Gateway live port 4001, paper 4002; TWS live 7496, paper 7497.
 # ---------------------------------------------------------------------------
 IBKR_HOST = "127.0.0.1"
 IBKR_PORT = 4001
 IBKR_CLIENT_ID = 17         # any id not used by another API client
 IBKR_TIMEOUT = 10           # seconds to wait for the connection
+IBKR_MARKET_DATA_TYPE = 2   # 1 live only; 2 live, or last values when the market is closed
+IBKR_BATCH_SIZE = 90        # puts priced at once (IBKR allows about 100 live quotes)
+IBKR_QUOTE_TIMEOUT = 6      # seconds to wait for a batch's prices and greeks
 IV_LOOKBACK = "1 Y"         # implied-volatility history window
 IV_MIN_DAYS = 120           # fewer daily IV values than this = stock skipped
 
@@ -60,7 +62,7 @@ SECTOR_GROUPS = {
 # ---------------------------------------------------------------------------
 # Liquidity filters
 # ---------------------------------------------------------------------------
-MIN_AVG_STOCK_VOLUME = 1_000_000   # 10-day average shares/day
+MIN_AVG_STOCK_VOLUME = 1_000_000   # IBKR 90-day average shares/day
 MIN_OPEN_INTEREST = 500
 MAX_SPREAD_PCT = 0.10              # (ask - bid) / mid
 MIN_BID = 0.20                     # ignore sub-20c options

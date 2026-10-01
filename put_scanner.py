@@ -2,14 +2,16 @@
 """
 Daily cash-secured put scanner for Nasdaq-100 tech names.
 
-Suggestions only. This script never places orders. It reads implied-volatility
-history from Interactive Brokers over a read-only API connection.
+Suggestions only. This script never places orders. Market data comes from
+Interactive Brokers over a read-only API connection. Earnings dates and open
+interest (a once-a-day figure) come from Yahoo Finance.
 
 Pipeline
-  1. Pull fresh quotes + option chains from Yahoo Finance (yfinance).
+  1. Pull stock prices, volume, and option chains from IBKR.
   2. Filter underlyings by price and liquidity.
   3. For each expiration in the DTE window (optionally skipping earnings),
-     pull the put chain and compute Black-Scholes delta from implied vol.
+     request live put quotes with IBKR's implied vol and delta, plus
+     open interest from Yahoo.
   4. Keep puts in the delta band with acceptable spread/OI and a bid that
      clears the annualized-return hurdle on cash collateral.
   5. For stocks with candidates, look up where today's implied vol sits in
@@ -33,8 +35,7 @@ from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
-from ib_async import IB, StartupFetch, Stock
-from scipy.stats import norm
+from ib_async import IB, Option, StartupFetch, Stock
 
 import config as C
 
@@ -44,6 +45,19 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 log = logging.getLogger("put_scanner")
+
+
+class HideMissingStrikes(logging.Filter):
+    """Hide IBKR's expected complaints about strikes that are not listed for every expiration."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Keep every IBKR log line except the expected missing-strike notices."""
+        msg = record.getMessage()
+        return not ("Error 200" in msg or msg.startswith("Unknown contract"))
+
+
+for _name in ("ib_async.wrapper", "ib_async.ib"):
+    logging.getLogger(_name).addFilter(HideMissingStrikes())
 
 
 # ---------------------------------------------------------------------------
@@ -90,41 +104,39 @@ class PreviousScan:
     displayed: list[PutCandidate]
 
 
-# ---------------------------------------------------------------------------
-# Math
-# ---------------------------------------------------------------------------
-def bs_put_delta(spot: float, strike: float, t_years: float, r: float, iv: float) -> float:
-    """Estimate how sensitive an option's price is to stock moves, used to gauge how risky a put is."""
-    if spot <= 0 or strike <= 0 or t_years <= 0 or iv <= 0:
-        return float("nan")
-    d1 = (math.log(spot / strike) + (r + 0.5 * iv * iv) * t_years) / (iv * math.sqrt(t_years))
-    return norm.cdf(d1) - 1.0
+@dataclass
+class PutQuote:
+    expiration: str   # YYYY-MM-DD
+    strike: float
+    bid: float
+    ask: float
+    iv: float
+    delta: float
+    volume: int
+
+
+def positive(x: float | None) -> bool:
+    """Tell whether a market data value is a real, usable positive number."""
+    return x is not None and isinstance(x, (int, float)) and math.isfinite(x) and x > 0
 
 
 # ---------------------------------------------------------------------------
-# Data fetch helpers (each wrapped so one bad ticker never kills the run)
+# Yahoo Finance: earnings dates (IBKR only offers these as a paid add-on) and
+# open interest (published once a day, so Yahoo's quote delay does not matter)
 # ---------------------------------------------------------------------------
-def get_spot_and_volume(tk: yf.Ticker) -> tuple[float | None, float | None]:
-    """Look up a stock's current price and typical daily trading volume."""
-    try:
-        fi = tk.fast_info
-        spot = float(fi["last_price"])
-        avg_vol = float(fi.get("ten_day_average_volume") or fi.get("three_month_average_volume") or 0)
-        if not avg_vol:
-            hist = tk.history(period="10d", auto_adjust=False)
-            avg_vol = float(hist["Volume"].mean()) if not hist.empty else 0.0
-        if spot and spot > 0:
-            return spot, (avg_vol or None)
-    except Exception:
-        pass
-    try:
-        hist = tk.history(period="10d", auto_adjust=False)
-        if hist.empty:
-            return None, None
-        return float(hist["Close"].iloc[-1]), float(hist["Volume"].mean())
-    except Exception as e:
-        log.warning("%s: could not get price (%s)", tk.ticker, e)
-        return None, None
+def get_open_interest(tk: yf.Ticker, expirations: set[str]) -> dict[tuple[str, float], int]:
+    """Look up how many contracts are open for each put, by expiration and strike."""
+    oi: dict[tuple[str, float], int] = {}
+    for exp in sorted(expirations):
+        try:
+            puts = tk.option_chain(exp).puts
+        except Exception as e:
+            log.warning("%s %s: open interest unavailable (%s)", tk.ticker, exp, e)
+            continue
+        for row in puts.itertuples(index=False):
+            if not pd.isna(row.openInterest):
+                oi[(exp, float(row.strike))] = int(row.openInterest)
+    return oi
 
 
 def get_next_earnings(tk: yf.Ticker, today: date | None = None) -> date | None:
@@ -154,7 +166,7 @@ def get_next_earnings(tk: yf.Ticker, today: date | None = None) -> date | None:
 
 
 # ---------------------------------------------------------------------------
-# IBKR implied-volatility history (read-only; no order code in this project)
+# IBKR market data (read-only; no order code in this project)
 # ---------------------------------------------------------------------------
 def connect_ibkr() -> IB | None:
     """Open a read-only market data connection to a running IB Gateway or TWS, if one is available."""
@@ -162,11 +174,85 @@ def connect_ibkr() -> IB | None:
     try:
         ib.connect(C.IBKR_HOST, C.IBKR_PORT, clientId=C.IBKR_CLIENT_ID, timeout=C.IBKR_TIMEOUT,
                    readonly=True, fetchFields=StartupFetch(0))
+        ib.reqMarketDataType(C.IBKR_MARKET_DATA_TYPE)
     except Exception as e:
         log.error("IBKR connection to %s:%s failed (%s); is IB Gateway/TWS running with the API enabled?",
                   C.IBKR_HOST, C.IBKR_PORT, e)
         return None
     return ib
+
+
+def get_stock(ib: IB, symbol: str) -> Stock | None:
+    """Find the stock's listing at IBKR."""
+    try:
+        stock = Stock(symbol, "SMART", "USD")
+        return stock if ib.qualifyContracts(stock) and stock.conId else None
+    except Exception as e:
+        log.warning("%s: IBKR contract lookup failed (%s)", symbol, e)
+        return None
+
+
+def get_spot_and_volume(ib: IB, stock: Stock) -> tuple[float | None, float | None]:
+    """Look up a stock's current price and IBKR's 90-day average daily trading volume."""
+    try:
+        ticker = ib.reqMktData(stock, "165", False, False)
+        deadline = time.monotonic() + C.IBKR_QUOTE_TIMEOUT
+        while time.monotonic() < deadline and not (positive(ticker.marketPrice()) and positive(ticker.avVolume)):
+            ib.sleep(0.25)
+        ib.cancelMktData(stock)
+    except Exception as e:
+        log.warning("%s: could not get price (%s)", stock.symbol, e)
+        return None, None
+    spot = ticker.marketPrice() if positive(ticker.marketPrice()) else ticker.close
+    return (float(spot) if positive(spot) else None), (float(ticker.avVolume) if positive(ticker.avVolume) else None)
+
+
+def get_put_contracts(ib: IB, stock: Stock, spot: float, keep_expiration) -> list[Option]:
+    """List the listed puts worth pricing: expirations in the window and strikes just below the stock price."""
+    params = [p for p in ib.reqSecDefOptParams(stock.symbol, "", stock.secType, stock.conId) if p.exchange == "SMART"]
+    if not params:
+        raise ScanSkipped("no listed option expirations")
+    low = spot * (1 - C.STRIKE_WINDOW)
+    wanted = []
+    for p in params:
+        strikes = [k for k in p.strikes if low <= k < spot and not (C.MAX_COLLATERAL and k * 100 > C.MAX_COLLATERAL)]
+        for exp in sorted(p.expirations):
+            if keep_expiration(exp):
+                wanted += [Option(stock.symbol, exp, k, "P", "SMART", tradingClass=p.tradingClass,
+                                  multiplier=p.multiplier, currency="USD") for k in strikes]
+    if not wanted:
+        return []
+    return [c for c in ib.qualifyContracts(*wanted) if c is not None and c.conId]
+
+
+def quote_is_complete(ticker) -> bool:
+    """Tell whether a put's price and greeks have both arrived."""
+    g = ticker.modelGreeks
+    return positive(ticker.bid) and positive(ticker.ask) and g is not None and g.delta is not None and math.isfinite(g.delta)
+
+
+def get_put_quotes(ib: IB, contracts: list[Option]) -> list[PutQuote]:
+    """Collect live prices, implied volatility, and delta for a set of puts."""
+    quotes = []
+    for i in range(0, len(contracts), C.IBKR_BATCH_SIZE):
+        tickers = [ib.reqMktData(c, "", False, False) for c in contracts[i:i + C.IBKR_BATCH_SIZE]]
+        deadline = time.monotonic() + C.IBKR_QUOTE_TIMEOUT
+        while time.monotonic() < deadline and not all(quote_is_complete(t) for t in tickers):
+            ib.sleep(0.25)
+        for t in tickers:
+            ib.cancelMktData(t.contract)
+            g = t.modelGreeks
+            exp = t.contract.lastTradeDateOrContractMonth
+            quotes.append(PutQuote(
+                expiration=f"{exp[:4]}-{exp[4:6]}-{exp[6:8]}",
+                strike=float(t.contract.strike),
+                bid=float(t.bid) if positive(t.bid) else 0.0,
+                ask=float(t.ask) if positive(t.ask) else 0.0,
+                iv=float(g.impliedVol) if g is not None and positive(g.impliedVol) else 0.0,
+                delta=float(g.delta) if g is not None and g.delta is not None else float("nan"),
+                volume=int(t.volume) if positive(t.volume) else 0,
+            ))
+    return quotes
 
 
 def get_iv_percentile(ib: IB, symbol: str) -> float | None:
@@ -205,12 +291,16 @@ def add_iv_percentile(ib: IB | None, symbol: str, found: list[PutCandidate]) -> 
 # ---------------------------------------------------------------------------
 # Scan
 # ---------------------------------------------------------------------------
-def scan_ticker(symbol: str, today: date) -> list[PutCandidate]:
+def scan_ticker(symbol: str, today: date, ib: IB | None) -> list[PutCandidate]:
     """Find qualifying puts for one stock or explain why it could not be evaluated."""
     if symbol in C.EXCLUDE_TICKERS:
         raise ScanSkipped("excluded in config")
-    tk = yf.Ticker(symbol)
-    spot, avg_vol = get_spot_and_volume(tk)
+    if ib is None:
+        raise ScanDataError("IBKR not connected")
+    stock = get_stock(ib, symbol)
+    if stock is None:
+        raise ScanDataError("stock not found at IBKR")
+    spot, avg_vol = get_spot_and_volume(ib, stock)
     if spot is None or not math.isfinite(spot) or spot <= 0:
         raise ScanDataError("stock price unavailable")
     if C.MAX_STOCK_PRICE and spot > C.MAX_STOCK_PRICE:
@@ -222,93 +312,81 @@ def scan_ticker(symbol: str, today: date) -> list[PutCandidate]:
         log.info("%s: skip, avg volume %.0f too low", symbol, avg_vol)
         raise ScanSkipped("average stock volume below limit")
 
-    earnings = get_next_earnings(tk, today) if C.SKIP_EARNINGS else None
+    yahoo = yf.Ticker(symbol)
+    earnings = get_next_earnings(yahoo, today) if C.SKIP_EARNINGS else None
     if C.SKIP_EARNINGS and earnings is None:
         raise ScanDataError("next earnings date unavailable")
 
-    try:
-        expirations = tk.options
-    except Exception as e:
-        log.warning("%s: no option chain (%s)", symbol, e)
-        raise ScanDataError("option expirations unavailable") from e
-    if not expirations:
-        raise ScanSkipped("no listed option expirations")
-
-    out: list[PutCandidate] = []
-    for exp_str in expirations:
-        exp = datetime.strptime(exp_str, "%Y-%m-%d").date()
-        dte = (exp - today).days
-        if dte < C.DTE_MIN or dte > C.DTE_MAX:
-            continue
+    def keep_expiration(exp_str: str) -> bool:
+        """Keep expirations inside the day window that finish before the next earnings report."""
+        exp = datetime.strptime(exp_str, "%Y%m%d").date()
+        if not C.DTE_MIN <= (exp - today).days <= C.DTE_MAX:
+            return False
         if earnings and today <= earnings <= exp:
             log.info("%s: skip %s, spans earnings %s", symbol, exp_str, earnings)
+            return False
+        return True
+
+    try:
+        contracts = get_put_contracts(ib, stock, spot, keep_expiration)
+    except ScanSkipped:
+        raise
+    except Exception as e:
+        log.warning("%s: option chain lookup failed (%s)", symbol, e)
+        raise ScanDataError("option chain unavailable") from e
+    if not contracts:
+        return []
+    quotes = get_put_quotes(ib, contracts)
+    if not any(q.bid > 0 or q.ask > 0 for q in quotes):
+        raise ScanDataError("no option quotes from IBKR")
+    open_interest = get_open_interest(yahoo, {q.expiration for q in quotes})
+
+    out: list[PutCandidate] = []
+    for q in quotes:
+        dte = (datetime.strptime(q.expiration, "%Y-%m-%d").date() - today).days
+        strike, bid, ask = q.strike, q.bid, q.ask   # strikes are already below spot and within MAX_COLLATERAL
+        if bid < C.MIN_BID or ask <= 0 or ask < bid:
+            continue
+        oi = open_interest.get((q.expiration, strike), 0)   # missing = unknown, so the contract is dropped
+        if oi < C.MIN_OPEN_INTEREST:
+            continue
+        mid = (bid + ask) / 2.0
+        spread_pct = (ask - bid) / mid if mid > 0 else 1.0
+        if spread_pct > C.MAX_SPREAD_PCT:
+            continue
+        if not math.isfinite(q.delta):
+            continue
+        adelta = abs(q.delta)
+        if adelta < C.DELTA_MIN or adelta > C.DELTA_MAX:
+            continue
+        ann = (bid / strike) * (365.0 / dte)
+        if ann < C.MIN_ANNUALIZED_RETURN:
             continue
 
-        try:
-            puts = tk.option_chain(exp_str).puts
-        except Exception as e:
-            log.warning("%s %s: chain fetch failed (%s)", symbol, exp_str, e)
-            raise ScanDataError(f"option chain unavailable for {exp_str}") from e
-        if puts is None or puts.empty:
-            raise ScanDataError(f"put chain empty for {exp_str}")
-
-        t_years = dte / 365.0
-        for row in puts.itertuples(index=False):
-            strike = float(row.strike)
-            bid = float(row.bid) if not pd.isna(row.bid) else 0.0
-            ask = float(row.ask) if not pd.isna(row.ask) else 0.0
-            iv = float(row.impliedVolatility) if not pd.isna(row.impliedVolatility) else 0.0
-            oi = int(row.openInterest) if not pd.isna(row.openInterest) else 0
-            vol = int(row.volume) if not pd.isna(row.volume) else 0
-
-            if strike >= spot:            # OTM puts only
-                continue
-            if C.MAX_COLLATERAL and strike * 100 > C.MAX_COLLATERAL:
-                continue
-            if bid < C.MIN_BID or ask <= 0 or ask < bid:
-                continue
-            if oi < C.MIN_OPEN_INTEREST:
-                continue
-            mid = (bid + ask) / 2.0
-            spread_pct = (ask - bid) / mid if mid > 0 else 1.0
-            if spread_pct > C.MAX_SPREAD_PCT:
-                continue
-
-            delta = bs_put_delta(spot, strike, t_years, C.RISK_FREE_RATE, iv)
-            if math.isnan(delta):
-                continue
-            adelta = abs(delta)
-            if adelta < C.DELTA_MIN or adelta > C.DELTA_MAX:
-                continue
-
-            ann = (bid / strike) * (365.0 / dte)
-            if ann < C.MIN_ANNUALIZED_RETURN:
-                continue
-
-            out.append(
-                PutCandidate(
-                    ticker=symbol,
-                    spot=round(spot, 2),
-                    expiration=exp_str,
-                    dte=dte,
-                    strike=strike,
-                    bid=bid,
-                    ask=ask,
-                    mid=round(mid, 2),
-                    iv=round(iv, 4),
-                    delta=round(delta, 3),
-                    open_interest=oi,
-                    volume=vol,
-                    spread_pct=round(spread_pct, 4),
-                    cushion_pct=round((spot - strike) / spot, 4),
-                    premium_per_contract=round(bid * 100, 2),
-                    collateral=round(strike * 100, 2),
-                    annualized_return=round(ann, 4),
-                    breakeven=round(strike - bid, 2),
-                    prob_otm=round(1 - adelta, 3),
-                    earnings_date=earnings.isoformat() if earnings else None,
-                )
+        out.append(
+            PutCandidate(
+                ticker=symbol,
+                spot=round(spot, 2),
+                expiration=q.expiration,
+                dte=dte,
+                strike=strike,
+                bid=bid,
+                ask=ask,
+                mid=round(mid, 2),
+                iv=round(q.iv, 4),
+                delta=round(q.delta, 3),
+                open_interest=oi,
+                volume=q.volume,
+                spread_pct=round(spread_pct, 4),
+                cushion_pct=round((spot - strike) / spot, 4),
+                premium_per_contract=round(bid * 100, 2),
+                collateral=round(strike * 100, 2),
+                annualized_return=round(ann, 4),
+                breakeven=round(strike - bid, 2),
+                prob_otm=round(1 - adelta, 3),
+                earnings_date=earnings.isoformat() if earnings else None,
             )
+        )
     return out
 
 
@@ -437,7 +515,7 @@ def to_markdown(
         f"# Cash-Secured Put Suggestions - {run_ts.strftime('%Y-%m-%d %H:%M %Z')}",
         "",
         f"Universe: {scanned} Nasdaq-100 names scanned · {total_cands} contracts passed filters · "
-        f"top {len(picks)} shown. Data: Yahoo Finance (may be ~15 min delayed). "
+        f"top {len(picks)} shown. Data: IBKR (earnings dates and open interest: Yahoo Finance). "
         "**Suggestions only; nothing is executed.**",
         "",
         f"Filters: |Δ| {C.DELTA_MIN:.2f}–{C.DELTA_MAX:.2f} · DTE {C.DTE_MIN}–{C.DTE_MAX} · "
@@ -574,7 +652,7 @@ def main() -> int:
     ib = connect_ibkr()
     for sym in C.UNIVERSE:
         try:
-            found = scan_ticker(sym, today)
+            found = scan_ticker(sym, today, ib)
             add_iv_percentile(ib, sym, found)
             scanned += 1
             log.info("%s: %d candidates", sym, len(found))
@@ -584,7 +662,7 @@ def main() -> int:
         except Exception as e:
             failures[sym] = str(e)
             log.error("%s: scan failed: %s", sym, e)
-        time.sleep(0.3)  # be polite to Yahoo
+        time.sleep(0.3)  # be polite to Yahoo (earnings dates)
     if ib is not None:
         ib.disconnect()
 
